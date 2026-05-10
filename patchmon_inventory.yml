@@ -14,3 +14,4 @@
 plugin:     patchmon.dynamic_inventory.dynamic_inventory
 verify_ssl: false
 timeout:    30
+

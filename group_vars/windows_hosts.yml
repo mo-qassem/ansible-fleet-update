@@ -1,0 +1,4 @@
+---
+winrm_port: 5986
+winrm_transport: ntlm
+winrm_server_cert_validation: ignore

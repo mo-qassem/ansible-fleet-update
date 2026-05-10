@@ -1,0 +1,4 @@
+---
+ansible_user:          exadmn
+ansible_become:        true
+ansible_become_method: sudo

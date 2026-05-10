@@ -8,15 +8,15 @@ DOCUMENTATION = r"""
     short_description: PatchMon dynamic inventory plugin
     description:
         - Queries the PatchMon REST API and builds an Ansible inventory.
-        - Automatically detects Windows hosts using two methods (in order):
-            1. Host is in a PatchMon group whose name contains 'windows'
-            2. Hostname/friendly_name matches common Windows hostname patterns
-        - Windows hosts get ansible_connection=winrm and WinRM vars set.
-        - Linux hosts get ansible_connection=ssh.
-        - All hosts are also placed into auto-groups 'linux_hosts' or 'windows_hosts'
-          so playbooks can use group intersection (:&) to target the right OS.
-        - Credentials are read from AWX environment variables — do NOT use
-          Jinja2 lookup() in the config file, it is not processed there.
+        - Uses PatchMon API os_type field to classify hosts.
+        - Windows hosts are placed only in windows_hosts.
+        - Linux hosts are placed only in linux_hosts.
+        - Hosts with missing or unknown os_type are placed in unknown_os_hosts.
+        - PatchMon host_groups such as Basic, Advanced, Professional are saved
+          as host variables only, not created as Ansible inventory groups.
+        - Credentials are read from AWX environment variables.
+        - Do NOT use Jinja2 lookup() in the inventory config file because AWX
+          inventory source sync does not process it the same way as a playbook.
     options:
         plugin:
             description: Plugin identifier.
@@ -56,47 +56,37 @@ DOCUMENTATION = r"""
             description: WinRM transport method.
             default: ntlm
             env: [{name: PATCHMON_WINRM_TRANSPORT}]
-        windows_hostname_patterns:
-            description: >
-                List of case-insensitive substrings. If any match the host's
-                friendly_name or hostname, the host is treated as Windows.
-                Used as fallback when no 'windows' group is assigned in PatchMon.
-            type: list
-            elements: string
-            default:
-                - win
-                - ws2
-                - dc01
-                - dc02
-                - "2k8"
-                - "2k12"
-                - "2k16"
-                - "2k19"
-                - "2k22"
-                - server2
-                - msft
+        winrm_server_cert_validation:
+            description: WinRM certificate validation mode.
+            default: ignore
+            env: [{name: PATCHMON_WINRM_CERT_VALIDATION}]
 """
 
 EXAMPLES = r"""
 # inventory/patchmon_inventory.yml
-# Only plugin: is needed — everything else comes from AWX env vars.
-plugin:     patchmon.dynamic_inventory.dynamic_inventory
-verify_ssl: false
-timeout:    30
 
-# Optional: add your own Windows hostname patterns
-# windows_hostname_patterns:
-#   - win
-#   - ws2
-#   - mydc
+plugin: patchmon.dynamic_inventory.dynamic_inventory
+verify_ssl: false
+timeout: 30
+winrm_port: 5986
+winrm_transport: ntlm
+winrm_server_cert_validation: ignore
+
+# API credentials should be added in AWX Inventory Source Environment Variables:
+#
+# PATCHMON_API_URL: "https://patchmon.example.com/api/v1/api/hosts/"
+# PATCHMON_API_KEY: "your_api_key"
+# PATCHMON_API_SECRET: "your_api_secret"
 """
 
 RETURN = r"""# noqa"""
 
 import json
+
 from ansible.errors import AnsibleError, AnsibleParserError
 from ansible.plugins.inventory import BaseInventoryPlugin
 from ansible.utils.display import Display
+
 
 display = Display()
 
@@ -107,31 +97,56 @@ except ImportError:
     HAS_REQUESTS = False
 
 
-def _detect_windows(host_data, group_names, hostname_patterns):
+def _detect_os_type(host_data):
     """
-    Returns (is_windows: bool, reason: str)
+    Detect OS using PatchMon API os_type.
 
-    Detection order:
-      1. Any assigned PatchMon group name contains 'windows' (case-insensitive)
-      2. friendly_name or hostname matches a windows_hostname_patterns entry
-      3. Default: Linux
+    Returns:
+      ("windows", reason)
+      ("linux", reason)
+      ("unknown", reason)
+
+    Expected PatchMon examples:
+      os_type: Windows
+      os_type: Linux
+      os_type: Ubuntu
+      os_type: CentOS
+      os_type: Rocky Linux
+      os_type: AlmaLinux
+      os_type: CloudLinux
     """
-    # Method 1 — group-based (most reliable, user controls this in PatchMon)
-    for gname in group_names:
-        if "windows" in gname.lower():
-            return True, "group '{0}' contains 'windows'".format(gname)
 
-    # Method 2 — hostname pattern matching (fallback)
-    friendly = host_data.get("friendly_name", "")
-    hostname  = host_data.get("hostname", "")
-    check_names = [friendly.lower(), hostname.lower()]
+    os_type_raw = host_data.get("os_type", "")
+    os_type = str(os_type_raw or "").strip().lower()
 
-    for pattern in hostname_patterns:
-        for name in check_names:
-            if pattern.lower() in name:
-                return True, "hostname pattern '{0}' matched '{1}'".format(pattern, name or friendly)
+    if not os_type:
+        return "unknown", "missing os_type from PatchMon API"
 
-    return False, "defaulting to Linux (no Windows indicators found)"
+    if "windows" in os_type:
+        return "windows", "os_type='{0}'".format(os_type_raw)
+
+    linux_indicators = [
+        "linux",
+        "ubuntu",
+        "debian",
+        "centos",
+        "rocky",
+        "alma",
+        "almalinux",
+        "cloudlinux",
+        "redhat",
+        "red hat",
+        "rhel",
+        "oracle linux",
+        "freebsd",
+        "unix",
+    ]
+
+    for indicator in linux_indicators:
+        if indicator in os_type:
+            return "linux", "os_type='{0}'".format(os_type_raw)
+
+    return "unknown", "unrecognized os_type='{0}'".format(os_type_raw)
 
 
 class InventoryModule(BaseInventoryPlugin):
@@ -152,41 +167,41 @@ class InventoryModule(BaseInventoryPlugin):
 
         if not HAS_REQUESTS:
             raise AnsibleError(
-                "PatchMon plugin requires: pip install requests>=2.25.1"
+                "PatchMon plugin requires Python requests library. "
+                "Install it with: pip install requests>=2.25.1"
             )
 
         self._read_config_data(path)
 
-        api_url             = self.get_option("api_url")
-        api_key             = self.get_option("api_key")
-        api_secret          = self.get_option("api_secret")
-        verify_ssl          = self.get_option("verify_ssl")
-        timeout             = self.get_option("timeout")
-        winrm_port          = self.get_option("winrm_port")
-        winrm_transport     = self.get_option("winrm_transport")
-        hostname_patterns   = self.get_option("windows_hostname_patterns")
+        api_url = self.get_option("api_url")
+        api_key = self.get_option("api_key")
+        api_secret = self.get_option("api_secret")
+        verify_ssl = self.get_option("verify_ssl")
+        timeout = self.get_option("timeout")
+        winrm_port = self.get_option("winrm_port")
+        winrm_transport = self.get_option("winrm_transport")
+        winrm_cert_validation = self.get_option("winrm_server_cert_validation")
 
-        # ── Validate env vars ─────────────────────────────────────────────────
-        missing = [k for k, v in {
-            "PATCHMON_API_URL":    api_url,
-            "PATCHMON_API_KEY":    api_key,
-            "PATCHMON_API_SECRET": api_secret,
-        }.items() if not v]
+        missing = [
+            key for key, value in {
+                "PATCHMON_API_URL": api_url,
+                "PATCHMON_API_KEY": api_key,
+                "PATCHMON_API_SECRET": api_secret,
+            }.items()
+            if not value
+        ]
 
         if missing:
             raise AnsibleError(
                 "PatchMon: missing environment variables: {0}\n"
-                "Fix: AWX → Inventories → Sources → [source] → "
-                "Environment Variables → add the missing vars there.\n"
-                "(Variables on the Job Template are NOT available during "
-                "inventory sync — they must be on the Source.)".format(
-                    ", ".join(missing)
-                )
+                "Fix in AWX:\n"
+                "Inventory → Sources → PatchMon source → Environment Variables.\n"
+                "Important: Job Template extra vars are not available during "
+                "inventory sync.".format(", ".join(missing))
             )
 
         display.vv("PatchMon: GET {0}".format(api_url))
 
-        # ── HTTP call ─────────────────────────────────────────────────────────
         try:
             resp = requests.get(
                 api_url,
@@ -197,141 +212,168 @@ class InventoryModule(BaseInventoryPlugin):
             )
         except requests.exceptions.SSLError as e:
             raise AnsibleError(
-                "PatchMon SSL error — set verify_ssl: false for self-signed certs.\n"
+                "PatchMon SSL error. If using a self-signed certificate, set "
+                "verify_ssl: false in inventory/patchmon_inventory.yml.\n"
                 "Detail: {0}".format(e)
             )
         except requests.exceptions.ConnectionError as e:
             raise AnsibleError(
-                "PatchMon: cannot reach {0}.\n"
-                "Check the URL is reachable from the AWX execution environment.\n"
+                "PatchMon: cannot reach {0} from the AWX execution environment.\n"
                 "Detail: {1}".format(api_url, e)
             )
         except requests.exceptions.Timeout:
             raise AnsibleError(
-                "PatchMon: request timed out after {0}s.".format(timeout)
+                "PatchMon: request timed out after {0} seconds.".format(timeout)
             )
 
-        # ── Detect HTML / wrong URL ───────────────────────────────────────────
         content_type = resp.headers.get("Content-Type", "")
-        preview      = resp.text[:300].strip()
+        preview = resp.text[:300].strip()
 
         if resp.status_code == 401:
             raise AnsibleError(
                 "PatchMon: HTTP 401 Unauthorized.\n"
-                "Check PATCHMON_API_KEY and PATCHMON_API_SECRET in the "
+                "Check PATCHMON_API_KEY and PATCHMON_API_SECRET in the AWX "
                 "inventory source environment variables.\n"
                 "URL: {0}".format(api_url)
             )
 
         if "text/html" in content_type or "<html" in preview.lower():
             raise AnsibleError(
-                "PatchMon: received HTML instead of JSON (HTTP {0}).\n\n"
-                "PATCHMON_API_URL must end with /api/v1/api/hosts/\n"
+                "PatchMon: received HTML instead of JSON. HTTP {0}\n\n"
+                "PATCHMON_API_URL must point to the hosts API endpoint, for example:\n"
+                "https://patchmon.example.com/api/v1/api/hosts/\n\n"
                 "Current URL: {1}\n"
-                "If the URL looks correct, check that the API credentials "
-                "are not expired.".format(resp.status_code, api_url)
+                "Preview: {2}".format(resp.status_code, api_url, preview[:200])
             )
 
         if resp.status_code != 200:
             raise AnsibleError(
                 "PatchMon: unexpected HTTP {0} from {1}\n"
-                "Body: {2}".format(resp.status_code, api_url, preview)
+                "Body preview: {2}".format(resp.status_code, api_url, preview)
             )
 
-        # ── Parse JSON ────────────────────────────────────────────────────────
         try:
             data = resp.json()
         except (json.JSONDecodeError, ValueError) as e:
             raise AnsibleParserError(
                 "PatchMon: non-JSON response.\n"
-                "URL: {0}\nPreview: {1}\nError: {2}".format(
-                    api_url, preview[:200], e
-                )
+                "URL: {0}\n"
+                "Preview: {1}\n"
+                "Error: {2}".format(api_url, preview[:200], e)
             )
 
         hosts = data.get("hosts", [])
+
         if not hosts:
             display.warning(
-                "PatchMon: API returned 0 hosts. "
-                "Check API key permissions."
+                "PatchMon: API returned 0 hosts. Check API URL and API key permissions."
             )
             return
 
         display.vv("PatchMon: {0} host(s) received".format(len(hosts)))
 
-        # Pre-create OS auto-groups
+        # Only these groups will be created for targeting playbooks.
         self.inventory.add_group("linux_hosts")
         self.inventory.add_group("windows_hosts")
+        self.inventory.add_group("unknown_os_hosts")
 
-        linux_count   = 0
+        linux_count = 0
         windows_count = 0
+        unknown_count = 0
 
         for h in hosts:
-            # API fields confirmed from actual response:
-            #   friendly_name, hostname, ip, id, host_groups[]{id, name}
-            friendly_name = h.get("friendly_name", "").strip()
-            hostname      = h.get("hostname", "").strip()
-            ip            = h.get("ip", "")
-            groups        = h.get("host_groups", [])
+            friendly_name = str(h.get("friendly_name", "") or "").strip()
+            hostname = str(h.get("hostname", "") or "").strip()
+            ip = str(h.get("ip", "") or "").strip()
+            host_id = str(h.get("id", "") or "").strip()
 
-            # Use friendly_name as the Ansible inventory hostname (what shows in AWX).
-            # Fall back to hostname if friendly_name is absent.
-            inv_hostname = friendly_name or hostname
+            # Friendly name is what will appear in AWX.
+            # Fallback order prevents skipping hosts if friendly_name is empty.
+            inv_hostname = friendly_name or hostname or host_id
 
             if not inv_hostname:
-                display.warning(
-                    "PatchMon: skipping host with no name — id: {0}".format(
-                        h.get("id", "unknown")
-                    )
-                )
+                display.warning("PatchMon: skipping host with no friendly_name, hostname, or id")
                 continue
 
             self.inventory.add_host(inv_hostname)
 
-            # ansible_host = IP so Ansible connects to the right address
             if ip:
                 self.inventory.set_variable(inv_hostname, "ansible_host", ip)
 
-            # Collect group names for detection logic
-            group_names_list = [g.get("name", "") for g in groups if g.get("name")]
+            # Keep useful PatchMon metadata as host vars.
+            self.inventory.set_variable(inv_hostname, "patchmon_id", h.get("id"))
+            self.inventory.set_variable(inv_hostname, "patchmon_hostname", hostname)
+            self.inventory.set_variable(inv_hostname, "patchmon_friendly_name", friendly_name)
+            self.inventory.set_variable(inv_hostname, "patchmon_os_type", h.get("os_type"))
+            self.inventory.set_variable(inv_hostname, "patchmon_needs_reboot", h.get("needs_reboot"))
+            self.inventory.set_variable(inv_hostname, "patchmon_last_update", h.get("last_update"))
 
-            # ── OS detection ──────────────────────────────────────────────────
-            is_windows, reason = _detect_windows(h, group_names_list, hostname_patterns)
+            # Keep Basic/Advanced/Professional as a variable only.
+            # We do not create Ansible groups from these.
+            patchmon_groups = []
+
+            for g in h.get("host_groups", []) or []:
+                group_name = str(g.get("name", "") or "").strip()
+                if group_name:
+                    patchmon_groups.append(group_name)
+
+            self.inventory.set_variable(inv_hostname, "patchmon_host_groups", patchmon_groups)
+
+            os_family, reason = _detect_os_type(h)
 
             display.vvv(
-                "PatchMon: {0} ({1}) → {2} [{3}]".format(
-                    inv_hostname, ip or "no IP",
-                    "Windows" if is_windows else "Linux",
+                "PatchMon: {0} ({1}) os_type={2} groups={3} -> {4} [{5}]".format(
+                    inv_hostname,
+                    ip or "no IP",
+                    h.get("os_type"),
+                    ",".join(patchmon_groups) if patchmon_groups else "no_groups",
+                    os_family,
                     reason,
                 )
             )
 
-            if is_windows:
+            if os_family == "windows":
                 self.inventory.add_child("windows_hosts", inv_hostname)
-                self.inventory.set_variable(inv_hostname, "ansible_connection",
-                                            "winrm")
-                self.inventory.set_variable(inv_hostname, "ansible_port",
-                                            winrm_port)
-                self.inventory.set_variable(inv_hostname, "ansible_winrm_transport",
-                                            winrm_transport)
-                self.inventory.set_variable(inv_hostname, "ansible_winrm_server_cert_validation",
-                                            "ignore")
+
+                self.inventory.set_variable(inv_hostname, "ansible_connection", "winrm")
+                self.inventory.set_variable(inv_hostname, "ansible_port", winrm_port)
+                self.inventory.set_variable(inv_hostname, "ansible_winrm_transport", winrm_transport)
+                self.inventory.set_variable(
+                    inv_hostname,
+                    "ansible_winrm_server_cert_validation",
+                    winrm_cert_validation,
+                )
+
                 windows_count += 1
-            else:
+
+            elif os_family == "linux":
                 self.inventory.add_child("linux_hosts", inv_hostname)
+
                 self.inventory.set_variable(inv_hostname, "ansible_connection", "ssh")
+
                 linux_count += 1
 
-            # ── Add to PatchMon host_groups (normalised) ──────────────────────
-            for g in groups:
-                name = g.get("name", "").strip()
-                if name:
-                    # Normalise: lowercase, spaces/hyphens → underscores
-                    safe = name.lower().replace(" ", "_").replace("-", "_")
-                    self.inventory.add_group(safe)
-                    self.inventory.add_child(safe, inv_hostname)
+            else:
+                self.inventory.add_child("unknown_os_hosts", inv_hostname)
+
+                # Do not assume Windows or Linux when os_type is missing/unknown.
+                # Keep ansible_connection unset so it does not accidentally run
+                # under the wrong connection type.
+                unknown_count += 1
+
+                display.warning(
+                    "PatchMon: host {0} has unknown os_type '{1}'. "
+                    "Added to unknown_os_hosts only.".format(
+                        inv_hostname,
+                        h.get("os_type"),
+                    )
+                )
 
         display.v(
-            "PatchMon: inventory ready — {0} Linux host(s), "
-            "{1} Windows host(s)".format(linux_count, windows_count)
+            "PatchMon: inventory ready — {0} Linux host(s), {1} Windows host(s), "
+            "{2} unknown host(s)".format(
+                linux_count,
+                windows_count,
+                unknown_count,
+            )
         )
