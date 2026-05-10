@@ -1,0 +1,7 @@
+---
+# group_vars/advanced.yml
+# PatchMon sends group names with capital first letter (Basic/Advanced/Professional).
+# The plugin normalises all group names to lowercase so this filename matches.
+ansible_user:          exadmn
+ansible_become:        true
+ansible_become_method: sudo

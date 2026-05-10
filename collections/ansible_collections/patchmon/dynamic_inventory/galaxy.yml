@@ -1,0 +1,6 @@
+namespace: patchmon
+name: dynamic_inventory
+version: 1.0.0
+description: PatchMon Ansible Dynamic Inventory Plugin
+license: [AGPL-3.0-or-later]
+repository: https://github.com/PatchMon/PatchMon-ansible

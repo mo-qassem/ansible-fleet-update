@@ -1,0 +1,9 @@
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+.vault_pass
+*.retry
+__pycache__/
+*.pyc
+.venv/

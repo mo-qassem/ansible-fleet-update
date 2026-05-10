@@ -1,0 +1,16 @@
+---
+# inventory/patchmon_inventory.yml
+#
+# !! DO NOT add api_url / api_key / api_secret here !!
+# Inventory plugin config files are NOT processed by Ansible's Jinja2 engine.
+# lookup('env', ...) returns empty string here — causing MissingSchema errors.
+#
+# The plugin reads PATCHMON_API_URL, PATCHMON_API_KEY, PATCHMON_API_SECRET
+# directly from environment variables via its DOCUMENTATION env: declarations.
+#
+# Set those variables in:
+#   AWX → Inventories → [inventory] → Sources → [source] → Environment Variables
+#
+plugin:     patchmon.dynamic_inventory.dynamic_inventory
+verify_ssl: false
+timeout:    30

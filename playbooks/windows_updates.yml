@@ -1,0 +1,55 @@
+---
+# =============================================================================
+# playbooks/windows_updates.yml
+#
+# Targets windows_hosts INTERSECTED with your tier groups.
+# The inventory plugin sets ansible_connection=winrm on these hosts automatically.
+#
+# Prerequisites on each Windows host (run once):
+#   winrm quickconfig -y
+#   winrm set winrm/config/service/auth @{NTLM="true"}
+#   netsh advfirewall firewall add rule name="WinRM HTTPS" dir=in action=allow protocol=TCP localport=5986
+#
+# AWX Job Template:
+#   Playbook:   playbooks/windows_updates.yml
+#   Inventory:  PatchMon Inventory
+#   Limit:      professional:&windows_hosts,advanced:&windows_hosts,basic:&windows_hosts
+#   Credential: Windows admin Machine Credential (username + password)
+#   Survey:     batch_size (default 3), windows_reboot (default true)
+# =============================================================================
+
+- name: Windows security updates
+  hosts: "professional:&windows_hosts,advanced:&windows_hosts,basic:&windows_hosts"
+  gather_facts: false
+  serial: "{{ batch_size | default(3) }}"
+
+  vars:
+    windows_reboot: true
+    windows_update_categories:
+      - CriticalUpdates
+      - SecurityUpdates
+      - UpdateRollups
+
+  tasks:
+
+    - name: Ping Windows hosts
+      ansible.windows.win_ping:
+
+    - name: Install Windows updates
+      ansible.windows.win_updates:
+        category_names:  "{{ windows_update_categories }}"
+        reboot:          "{{ windows_reboot | bool }}"
+        reboot_timeout:  3600
+        log_path:        C:\Windows\Temp\awx-windows-updates.log
+      register: win_result
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg:
+          - "┌─ {{ inventory_hostname }}"
+          - "│  Groups   : {{ group_names | join(', ') }}"
+          - "│  Found    : {{ win_result.found_update_count | default('n/a') }}"
+          - "│  Installed: {{ win_result.installed_update_count | default('n/a') }}"
+          - "│  Failed   : {{ win_result.failed_update_count | default(0) }}"
+          - "│  Rebooted : {{ win_result.rebooted | default(false) }}"
+          - "└──────────────────────────────"

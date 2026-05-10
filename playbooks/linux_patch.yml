@@ -1,0 +1,206 @@
+---
+# =============================================================================
+# playbooks/linux_patch.yml
+#
+# The inventory plugin automatically puts every host into either:
+#   linux_hosts   → ansible_connection=ssh  set by plugin
+#   windows_hosts → ansible_connection=winrm set by plugin
+#
+# This playbook targets linux_hosts INTERSECTED with your tier groups:
+#   professional:&linux_hosts,advanced:&linux_hosts,basic:&linux_hosts
+# That means: "hosts that are in (professional OR advanced OR basic) AND in linux_hosts"
+# Windows servers in those same groups are skipped entirely.
+#
+# Per Linux host:
+#   1. Auto-detects apt / dnf / yum
+#   2. Runs the correct package update
+#   3. Detects cPanel per host → runs /scripts/upcp --force if active
+#   4. Checks reboot requirement
+#   5. Prints full summary
+#
+# AWX Job Template:
+#   Playbook:   playbooks/linux_patch.yml
+#   Inventory:  PatchMon Inventory
+#   Limit:      professional:&linux_hosts,advanced:&linux_hosts,basic:&linux_hosts
+#   Credential: exadmn SSH key (Machine Credential)
+#   ✓ Enable Privilege Escalation
+#   Survey:     batch_size (default 10), reboot_allowed (default false)
+# =============================================================================
+
+- name: Linux patch + cPanel upcp (if present)
+  hosts: "professional:&linux_hosts,advanced:&linux_hosts,basic:&linux_hosts"
+  become: true
+  gather_facts: true
+  serial: "{{ batch_size | default(10) }}"
+
+  vars:
+    reboot_allowed: false
+    patch_log_dir:  /var/log/awx-patching
+
+  pre_tasks:
+    - name: Create patch log directory
+      ansible.builtin.file:
+        path:  "{{ patch_log_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode:  "0750"
+      tags: [always]
+
+    - name: Show host info
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} |
+          group(s): {{ group_names | join(', ') }} |
+          {{ ansible_distribution }} {{ ansible_distribution_version }} |
+          pkg_mgr: {{ ansible_pkg_mgr }}
+      tags: [always]
+
+  tasks:
+
+    # ── Package updates ───────────────────────────────────────────────────────
+
+    - name: APT — refresh cache
+      ansible.builtin.apt:
+        update_cache:     true
+        cache_valid_time: 0
+      when: ansible_os_family == "Debian"
+      tags: [packages]
+
+    - name: APT — dist-upgrade
+      ansible.builtin.apt:
+        upgrade:      dist
+        autoremove:   true
+        autoclean:    true
+        dpkg_options: "force-confdef,force-confold"
+      when: ansible_os_family == "Debian"
+      tags: [packages]
+
+    - name: DNF — upgrade all packages
+      ansible.builtin.dnf:
+        name:         "*"
+        state:        latest
+        update_cache: true
+        update_only:  true
+      when:
+        - ansible_os_family == "RedHat"
+        - ansible_pkg_mgr in ["dnf", "dnf5"]
+      tags: [packages]
+
+    - name: DNF — autoremove
+      ansible.builtin.dnf:
+        autoremove: true
+      when:
+        - ansible_os_family == "RedHat"
+        - ansible_pkg_mgr in ["dnf", "dnf5"]
+      tags: [packages]
+
+    - name: YUM — upgrade all packages
+      ansible.builtin.yum:
+        name:         "*"
+        state:        latest
+        update_cache: true
+      when:
+        - ansible_os_family == "RedHat"
+        - ansible_pkg_mgr == "yum"
+      tags: [packages]
+
+    # ── cPanel detection + upcp ───────────────────────────────────────────────
+
+    - name: cPanel | Check /scripts/upcp exists
+      ansible.builtin.stat:
+        path: /scripts/upcp
+      register: upcp_stat
+      tags: [cpanel]
+
+    - name: cPanel | Check service is active
+      ansible.builtin.systemd:
+        name: cpanel
+      register: cpanel_svc
+      failed_when: false
+      when: upcp_stat.stat.exists
+      tags: [cpanel]
+
+    - name: cPanel | Set detection flag
+      ansible.builtin.set_fact:
+        cpanel_active: >-
+          {{
+            upcp_stat.stat.exists and
+            cpanel_svc is defined and
+            cpanel_svc.status is defined and
+            cpanel_svc.status.ActiveState == 'active'
+          }}
+      tags: [cpanel]
+
+    - name: cPanel | Run /scripts/upcp --force
+      ansible.builtin.shell: |
+        set -o pipefail
+        /scripts/upcp --force 2>&1 | tee "{{ patch_log_dir }}/upcp-{{ ansible_date_time.iso8601_basic_short }}.log"
+      args:
+        executable: /bin/bash
+      register: upcp_result
+      changed_when: true
+      async:  7200
+      poll:   30
+      when: cpanel_active | bool
+      tags: [cpanel]
+
+    - name: cPanel | Restart httpd
+      ansible.builtin.command: /scripts/restartsrv_httpd
+      failed_when: false
+      when:
+        - cpanel_active | bool
+        - upcp_result is defined
+        - upcp_result is not skipped
+        - upcp_result.rc == 0
+      tags: [cpanel]
+
+    # ── Reboot check ──────────────────────────────────────────────────────────
+
+    - name: Reboot | Check reboot-required — Debian/Ubuntu
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: debian_reboot
+      when: ansible_os_family == "Debian"
+      tags: [reboot]
+
+    - name: Reboot | Check needs-restarting — RHEL family
+      ansible.builtin.command: needs-restarting -r
+      register: rhel_reboot
+      failed_when: false
+      changed_when: false
+      when: ansible_os_family == "RedHat"
+      tags: [reboot]
+
+    - name: Reboot | Set fact
+      ansible.builtin.set_fact:
+        reboot_needed: >-
+          {{
+            (ansible_os_family == 'Debian' and debian_reboot.stat.exists | default(false)) or
+            (ansible_os_family == 'RedHat' and rhel_reboot.rc | default(0) != 0)
+          }}
+      tags: [reboot]
+
+    - name: Reboot | Reboot if allowed and required
+      ansible.builtin.reboot:
+        msg:            "Reboot by AWX after package update"
+        reboot_timeout: 1800
+      when:
+        - reboot_allowed | bool
+        - reboot_needed | bool
+      tags: [reboot]
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg:
+          - "┌─ {{ inventory_hostname }}"
+          - "│  Groups  : {{ group_names | join(', ') }}"
+          - "│  OS      : {{ ansible_distribution }} {{ ansible_distribution_version }}"
+          - "│  Pkg mgr : {{ ansible_pkg_mgr }}"
+          - "│  Packages: updated ✓"
+          - "│  cPanel  : {% if cpanel_active | bool %}upcp ran ✓{% else %}not present — skipped{% endif %}"
+          - "│  Reboot  : {{ 'REQUIRED' if reboot_needed | bool else 'not needed' }}{% if reboot_allowed | bool and reboot_needed | bool %} — rebooted ✓{% endif %}"
+          - "└──────────────────────────────"
+      tags: [always]
