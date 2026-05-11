@@ -15,3 +15,6 @@ plugin:     patchmon.dynamic_inventory.dynamic_inventory
 verify_ssl: false
 timeout:    30
 
+winrm_port: 5986
+winrm_transport: ntlm
+winrm_server_cert_validation: ignore
