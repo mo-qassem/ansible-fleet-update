@@ -1,16 +1,6 @@
 ---
-# =============================================================================
-# playbooks/test_connectivity.yml
-# Tests SSH on Linux hosts and WinRM on Windows hosts separately.
-# Run this after every inventory sync to confirm all hosts are reachable.
-#
-# AWX Job Templates (create two):
-#   "Test - Linux"   → Limit: professional:&linux_hosts,advanced:&linux_hosts,basic:&linux_hosts
-#   "Test - Windows" → Limit: professional:&windows_hosts,advanced:&windows_hosts,basic:&windows_hosts
-# =============================================================================
-
 - name: Test Linux connectivity
-  hosts: "professional:&linux_hosts,advanced:&linux_hosts,basic:&linux_hosts"
+  hosts: linux_hosts
   gather_facts: false
   tasks:
     - name: Ping
@@ -20,7 +10,7 @@
         msg: "{{ inventory_hostname }} | groups: {{ group_names | join(', ') }} — SSH ✓"
 
 - name: Test Windows connectivity
-  hosts: "professional:&windows_hosts,advanced:&windows_hosts,basic:&windows_hosts"
+  hosts: windows_hosts
   gather_facts: false
   tasks:
     - name: Ping

@@ -1,34 +1,6 @@
 ---
-# =============================================================================
-# playbooks/linux_patch.yml
-#
-# The inventory plugin automatically puts every host into either:
-#   linux_hosts   → ansible_connection=ssh  set by plugin
-#   windows_hosts → ansible_connection=winrm set by plugin
-#
-# This playbook targets linux_hosts INTERSECTED with your tier groups:
-#   professional:&linux_hosts,advanced:&linux_hosts,basic:&linux_hosts
-# That means: "hosts that are in (professional OR advanced OR basic) AND in linux_hosts"
-# Windows servers in those same groups are skipped entirely.
-#
-# Per Linux host:
-#   1. Auto-detects apt / dnf / yum
-#   2. Runs the correct package update
-#   3. Detects cPanel per host → runs /scripts/upcp --force if active
-#   4. Checks reboot requirement
-#   5. Prints full summary
-#
-# AWX Job Template:
-#   Playbook:   playbooks/linux_patch.yml
-#   Inventory:  PatchMon Inventory
-#   Limit:      professional:&linux_hosts,advanced:&linux_hosts,basic:&linux_hosts
-#   Credential: exadmn SSH key (Machine Credential)
-#   ✓ Enable Privilege Escalation
-#   Survey:     batch_size (default 10), reboot_allowed (default false)
-# =============================================================================
-
 - name: Linux patch + cPanel upcp (if present)
-  hosts: "professional:&linux_hosts,advanced:&linux_hosts,basic:&linux_hosts"
+  hosts: linux_hosts
   become: true
   gather_facts: true
   serial: "{{ batch_size | default(10) }}"
