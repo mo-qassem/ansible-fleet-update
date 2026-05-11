@@ -1,5 +1,4 @@
 ---
-
 - name: Windows security updates
   hosts: windows_hosts
   gather_facts: false
