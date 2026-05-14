@@ -1,0 +1,10 @@
+---
+- name: Test Windows connectivity
+  hosts: windows_hosts
+  gather_facts: false
+  tasks:
+    - name: Ping
+      ansible.windows.win_ping:
+    - name: Show
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} | groups: {{ group_names | join(', ') }} — WinRM ✓"

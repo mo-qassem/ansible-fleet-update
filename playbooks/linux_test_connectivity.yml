@@ -1,0 +1,10 @@
+---
+- name: Test Linux connectivity
+  hosts: linux_hosts
+  gather_facts: false
+  tasks:
+    - name: Ping
+      ansible.builtin.ping:
+    - name: Show
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} | groups: {{ group_names | join(', ') }} — SSH ✓"

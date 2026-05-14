@@ -9,17 +9,9 @@
 #   winrm quickconfig -y
 #   winrm set winrm/config/service/auth @{NTLM="true"}
 #   netsh advfirewall firewall add rule name="WinRM HTTPS" dir=in action=allow protocol=TCP localport=5986
-#
-# AWX Job Template:
-#   Playbook:   playbooks/windows_updates.yml
-#   Inventory:  PatchMon Inventory
-#   Limit:      professional:&windows_hosts,advanced:&windows_hosts,basic:&windows_hosts
-#   Credential: Windows admin Machine Credential (username + password)
-#   Survey:     batch_size (default 3), windows_reboot (default true)
-# =============================================================================
 
 - name: Windows security updates
-  hosts: "professional:&windows_hosts,advanced:&windows_hosts,basic:&windows_hosts"
+  hosts: windows_hosts
   gather_facts: false
   serial: "{{ batch_size | default(3) }}"
 
