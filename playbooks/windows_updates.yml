@@ -1,15 +1,4 @@
 ---
-# =============================================================================
-# playbooks/windows_updates.yml
-#
-# Targets windows_hosts INTERSECTED with your tier groups.
-# The inventory plugin sets ansible_connection=winrm on these hosts automatically.
-#
-# Prerequisites on each Windows host (run once):
-#   winrm quickconfig -y
-#   winrm set winrm/config/service/auth @{NTLM="true"}
-#   netsh advfirewall firewall add rule name="WinRM HTTPS" dir=in action=allow protocol=TCP localport=5986
-
 - name: Windows security updates
   hosts: windows_hosts
   gather_facts: false
