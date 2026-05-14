@@ -110,7 +110,7 @@
       tags: [cpanel]
 
     - name: cPanel | Restart 
-      ansible.builtin.command: /scripts/restartsrv_httpd
+      ansible.builtin.command: /scripts/restartsrv_cpsrvd --hard
       failed_when: false
       when:
         - cpanel_active | bool
