@@ -59,14 +59,6 @@
         - ansible_pkg_mgr in ["dnf", "dnf5"]
       tags: [packages]
 
-    - name: DNF — autoremove
-      ansible.builtin.dnf:
-        autoremove: true
-      when:
-        - ansible_os_family == "RedHat"
-        - ansible_pkg_mgr in ["dnf", "dnf5"]
-      tags: [packages]
-
     - name: YUM — upgrade all packages
       ansible.builtin.yum:
         name:         "*"
