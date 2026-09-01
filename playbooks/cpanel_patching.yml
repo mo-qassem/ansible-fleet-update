@@ -1,0 +1,688 @@
+---
+# ============================================================
+# cPanel Fleet Audit + Forced Update
+# ============================================================
+#
+# Workflow:
+#   1. Detect whether cPanel is installed
+#   2. Get current cPanel version
+#   3. Inspect /etc/cpupdate.conf
+#   4. If CPANEL=<numeric version>, change to CPANEL=release
+#   5. Run /scripts/upcp --force
+#   6. Run /scripts/restartsrv_cpsrvd --hard
+#   7. Get cPanel version after update
+#   8. Produce consolidated fleet report
+#
+# ============================================================
+
+- name: Audit and update cPanel servers
+  hosts: linux_hosts
+  become: true
+  gather_facts: true
+  serial: 3
+
+  vars:
+    cpanel_binary: "/usr/local/cpanel/cpanel"
+    cpupdate_file: "/etc/cpupdate.conf"
+    upcp_binary: "/scripts/upcp"
+    cpsrvd_restart_binary: "/scripts/restartsrv_cpsrvd"
+    upcp_timeout: 7200
+
+  tasks:
+
+    # ========================================================
+    # Initialize report variables
+    # ========================================================
+
+    - name: Initialize cPanel update report
+      ansible.builtin.set_fact:
+        cpanel_installed: false
+        cpanel_version_before: "N/A"
+        cpanel_version_after: "N/A"
+
+        cpupdate_before: "N/A"
+        cpupdate_after: "N/A"
+        cpupdate_modified: false
+
+        update_status: "NOT_PROCESSED"
+        update_message: "Server has not been processed yet"
+
+        upcp_return_code: "N/A"
+        upcp_stdout_tail: []
+        upcp_stderr: ""
+
+        cpsrvd_restart_status: "NOT_RUN"
+        cpsrvd_restart_return_code: "N/A"
+        cpsrvd_restart_stdout: ""
+        cpsrvd_restart_stderr: ""
+
+    # ========================================================
+    # Detect cPanel
+    # ========================================================
+
+    - name: Check whether cPanel is installed
+      ansible.builtin.stat:
+        path: "{{ cpanel_binary }}"
+      register: cpanel_binary_stat
+
+    - name: Set cPanel installation status
+      ansible.builtin.set_fact:
+        cpanel_installed: "{{ cpanel_binary_stat.stat.exists | default(false) }}"
+
+    # ========================================================
+    # Handle servers without cPanel
+    # ========================================================
+
+    - name: Mark servers without cPanel
+      ansible.builtin.set_fact:
+        update_status: "NO_CPANEL"
+        update_message: "cPanel was not detected on this server"
+      when: not cpanel_installed | bool
+
+    - name: Display non-cPanel server
+      ansible.builtin.debug:
+        msg:
+          - "===================================================="
+          - "Host             : {{ inventory_hostname }}"
+          - "IP               : {{ ansible_default_ipv4.address | default('Unknown') }}"
+          - "OS               : {{ ansible_distribution | default('Unknown') }} {{ ansible_distribution_version | default('') }}"
+          - "cPanel Installed : NO"
+          - "Action           : SKIPPED"
+          - "Reason           : {{ cpanel_binary }} was not found"
+          - "===================================================="
+      when: not cpanel_installed | bool
+
+    # ========================================================
+    # Process cPanel servers
+    # ========================================================
+
+    - name: Process cPanel server
+      when: cpanel_installed | bool
+      block:
+
+        # ====================================================
+        # 1. Get cPanel version before update
+        # ====================================================
+
+        - name: Get current cPanel version
+          ansible.builtin.command:
+            argv:
+              - "{{ cpanel_binary }}"
+              - "-V"
+          register: cpanel_version_before_result
+          changed_when: false
+          failed_when: false
+
+        - name: Save current cPanel version
+          ansible.builtin.set_fact:
+            cpanel_version_before: >-
+              {{
+                cpanel_version_before_result.stdout
+                | default('Unable to determine version')
+                | trim
+              }}
+
+        - name: Display current cPanel version
+          ansible.builtin.debug:
+            msg:
+              - "Host                  : {{ inventory_hostname }}"
+              - "Current cPanel version: {{ cpanel_version_before }}"
+
+        # ====================================================
+        # 2. Check /etc/cpupdate.conf
+        # ====================================================
+
+        - name: Check whether cpupdate.conf exists
+          ansible.builtin.stat:
+            path: "{{ cpupdate_file }}"
+          register: cpupdate_file_stat
+
+        - name: Read current CPANEL setting
+          ansible.builtin.shell: |
+            set -o pipefail
+            grep -E '^CPANEL=' "{{ cpupdate_file }}" | head -n 1
+          args:
+            executable: /bin/bash
+          register: cpupdate_before_result
+          changed_when: false
+          failed_when: false
+          when: cpupdate_file_stat.stat.exists
+
+        - name: Store current CPANEL configuration
+          ansible.builtin.set_fact:
+            cpupdate_before: >-
+              {{
+                cpupdate_before_result.stdout
+                | default('')
+                | trim
+                if (cpupdate_before_result.stdout | default('') | trim | length > 0)
+                else 'CPANEL=<not-found>'
+              }}
+          when: cpupdate_file_stat.stat.exists
+
+        - name: Mark missing cpupdate.conf
+          ansible.builtin.set_fact:
+            cpupdate_before: "FILE_NOT_FOUND"
+          when: not cpupdate_file_stat.stat.exists
+
+        - name: Display current update configuration
+          ansible.builtin.debug:
+            msg:
+              - "cpupdate.conf exists : {{ cpupdate_file_stat.stat.exists }}"
+              - "Current setting      : {{ cpupdate_before }}"
+
+        # ====================================================
+        # 3. Detect numeric CPANEL= value
+        #
+        # Examples:
+        #
+        # CPANEL=11.134
+        # CPANEL=134
+        # CPANEL=134.0
+        # CPANEL=136.0.37
+        #
+        # become:
+        #
+        # CPANEL=release
+        #
+        # Values such as release/current/edge remain untouched.
+        # ====================================================
+
+        - name: Determine whether CPANEL setting contains numeric version
+          ansible.builtin.set_fact:
+            cpupdate_numeric_value: >-
+              {{
+                (cpupdate_before | trim)
+                is match('^CPANEL=[0-9]+([.][0-9]+)*$')
+              }}
+
+        - name: Display numeric version detection
+          ansible.builtin.debug:
+            msg:
+              - "CPANEL setting      : {{ cpupdate_before }}"
+              - "Numeric pin detected: {{ cpupdate_numeric_value }}"
+
+        # ====================================================
+        # 4. Change numeric version to release
+        # ====================================================
+
+        - name: Change numeric CPANEL version to release
+          ansible.builtin.lineinfile:
+            path: "{{ cpupdate_file }}"
+            regexp: '^CPANEL=[0-9]+([.][0-9]+)*$'
+            line: 'CPANEL=release'
+            backup: true
+          register: cpupdate_change_result
+          when:
+            - cpupdate_file_stat.stat.exists
+            - cpupdate_numeric_value | bool
+
+        - name: Save cpupdate modification state
+          ansible.builtin.set_fact:
+            cpupdate_modified: >-
+              {{
+                cpupdate_change_result.changed
+                | default(false)
+              }}
+
+        # ====================================================
+        # Re-read CPANEL configuration
+        # ====================================================
+
+        - name: Read CPANEL setting after validation
+          ansible.builtin.shell: |
+            set -o pipefail
+            grep -E '^CPANEL=' "{{ cpupdate_file }}" | head -n 1
+          args:
+            executable: /bin/bash
+          register: cpupdate_after_result
+          changed_when: false
+          failed_when: false
+          when: cpupdate_file_stat.stat.exists
+
+        - name: Store final CPANEL configuration
+          ansible.builtin.set_fact:
+            cpupdate_after: >-
+              {{
+                cpupdate_after_result.stdout
+                | default('')
+                | trim
+                if (cpupdate_after_result.stdout | default('') | trim | length > 0)
+                else 'CPANEL=<not-found>'
+              }}
+          when: cpupdate_file_stat.stat.exists
+
+        - name: Mark final configuration when file is missing
+          ansible.builtin.set_fact:
+            cpupdate_after: "FILE_NOT_FOUND"
+          when: not cpupdate_file_stat.stat.exists
+
+        - name: Display cpupdate configuration result
+          ansible.builtin.debug:
+            msg:
+              - "Previous configuration : {{ cpupdate_before }}"
+              - "Current configuration  : {{ cpupdate_after }}"
+              - "Configuration modified : {{ cpupdate_modified }}"
+
+        # ====================================================
+        # 5. Validate /scripts/upcp
+        # ====================================================
+
+        - name: Check cPanel updater command
+          ansible.builtin.stat:
+            path: "{{ upcp_binary }}"
+          register: upcp_binary_stat
+
+        - name: Report missing cPanel updater
+          ansible.builtin.set_fact:
+            update_status: "FAILED"
+            update_message: "cPanel exists but {{ upcp_binary }} was not found"
+          when: not upcp_binary_stat.stat.exists
+
+        # ====================================================
+        # 6. Run /scripts/upcp --force
+        # ====================================================
+
+        - name: Run forced cPanel update
+          ansible.builtin.command:
+            argv:
+              - "{{ upcp_binary }}"
+              - "--force"
+          register: upcp_result
+
+          # Ansible waits for completion while polling.
+          async: "{{ upcp_timeout }}"
+          poll: 30
+
+          changed_when: true
+          failed_when: false
+
+          when:
+            - upcp_binary_stat.stat.exists
+
+        # ====================================================
+        # Store upcp result
+        # ====================================================
+
+        - name: Store cPanel update result
+          ansible.builtin.set_fact:
+            upcp_return_code: "{{ upcp_result.rc | default('N/A') }}"
+            upcp_stdout_tail: "{{ (upcp_result.stdout_lines | default([]))[-20:] }}"
+            upcp_stderr: "{{ upcp_result.stderr | default('') | trim }}"
+          when:
+            - upcp_binary_stat.stat.exists
+
+        - name: Display cPanel update result
+          ansible.builtin.debug:
+            msg:
+              - "----------------------------------------------------"
+              - "cPanel Update"
+              - "----------------------------------------------------"
+              - "Host        : {{ inventory_hostname }}"
+              - "Return Code : {{ upcp_return_code }}"
+              - "Result      : {{ 'SUCCESS' if (upcp_result.rc | default(1) | int == 0) else 'FAILED' }}"
+              - "----------------------------------------------------"
+          when:
+            - upcp_binary_stat.stat.exists
+
+        # ====================================================
+        # 7. Check cpsrvd restart command
+        # ====================================================
+
+        - name: Check cpsrvd restart command
+          ansible.builtin.stat:
+            path: "{{ cpsrvd_restart_binary }}"
+          register: cpsrvd_restart_binary_stat
+
+        # ====================================================
+        # 8. Restart cpsrvd after successful update
+        #
+        # Command:
+        # /scripts/restartsrv_cpsrvd --hard
+        #
+        # Only run when upcp completed successfully.
+        # ====================================================
+
+        - name: Hard restart cPanel cpsrvd service
+          ansible.builtin.command:
+            argv:
+              - "{{ cpsrvd_restart_binary }}"
+              - "--hard"
+          register: cpsrvd_restart_result
+          changed_when: true
+          failed_when: false
+          when:
+            - upcp_binary_stat.stat.exists
+            - upcp_result.rc | default(1) | int == 0
+            - cpsrvd_restart_binary_stat.stat.exists
+
+        # ====================================================
+        # Store cpsrvd restart result
+        # ====================================================
+
+        - name: Store successful cpsrvd restart result
+          ansible.builtin.set_fact:
+            cpsrvd_restart_status: >-
+              {{
+                'SUCCESS'
+                if (cpsrvd_restart_result.rc | default(1) | int == 0)
+                else 'FAILED'
+              }}
+            cpsrvd_restart_return_code: "{{ cpsrvd_restart_result.rc | default('N/A') }}"
+            cpsrvd_restart_stdout: "{{ cpsrvd_restart_result.stdout | default('') | trim }}"
+            cpsrvd_restart_stderr: "{{ cpsrvd_restart_result.stderr | default('') | trim }}"
+          when:
+            - upcp_binary_stat.stat.exists
+            - upcp_result.rc | default(1) | int == 0
+            - cpsrvd_restart_binary_stat.stat.exists
+
+        - name: Mark missing cpsrvd restart command
+          ansible.builtin.set_fact:
+            cpsrvd_restart_status: "FAILED"
+            cpsrvd_restart_return_code: "N/A"
+            cpsrvd_restart_stderr: "{{ cpsrvd_restart_binary }} was not found"
+          when:
+            - upcp_binary_stat.stat.exists
+            - upcp_result.rc | default(1) | int == 0
+            - not cpsrvd_restart_binary_stat.stat.exists
+
+        - name: Mark cpsrvd restart skipped because update failed
+          ansible.builtin.set_fact:
+            cpsrvd_restart_status: "SKIPPED"
+          when:
+            - upcp_binary_stat.stat.exists
+            - upcp_result.rc | default(1) | int != 0
+
+        - name: Display cpsrvd restart result
+          ansible.builtin.debug:
+            msg:
+              - "----------------------------------------------------"
+              - "cpsrvd Hard Restart"
+              - "----------------------------------------------------"
+              - "Host        : {{ inventory_hostname }}"
+              - "Status      : {{ cpsrvd_restart_status }}"
+              - "Return Code : {{ cpsrvd_restart_return_code }}"
+              - "Output      : {{ cpsrvd_restart_stdout | default('') }}"
+              - "Error       : {{ cpsrvd_restart_stderr | default('') }}"
+              - "----------------------------------------------------"
+
+        # ====================================================
+        # 9. Get cPanel version AFTER update + cpsrvd restart
+        # ====================================================
+
+        - name: Get cPanel version after update
+          ansible.builtin.command:
+            argv:
+              - "{{ cpanel_binary }}"
+              - "-V"
+          register: cpanel_version_after_result
+          changed_when: false
+          failed_when: false
+
+        - name: Save cPanel version after update
+          ansible.builtin.set_fact:
+            cpanel_version_after: >-
+              {{
+                cpanel_version_after_result.stdout
+                | default('Unable to determine version')
+                | trim
+              }}
+
+        # ====================================================
+        # 10. Determine final server result
+        # ====================================================
+
+        - name: Mark successful cPanel update
+          ansible.builtin.set_fact:
+            update_status: "SUCCESS"
+            update_message: "cPanel update and cpsrvd restart completed successfully"
+          when:
+            - upcp_binary_stat.stat.exists
+            - upcp_result.rc | default(1) | int == 0
+            - cpsrvd_restart_status == "SUCCESS"
+
+        - name: Mark failed cPanel update
+          ansible.builtin.set_fact:
+            update_status: "FAILED"
+            update_message: >-
+              cPanel update failed with return code
+              {{ upcp_result.rc | default('unknown') }}
+          when:
+            - upcp_binary_stat.stat.exists
+            - upcp_result.rc | default(1) | int != 0
+
+        - name: Mark failed cpsrvd restart
+          ansible.builtin.set_fact:
+            update_status: "FAILED"
+            update_message: >-
+              cPanel update completed successfully but
+              /scripts/restartsrv_cpsrvd --hard failed
+              with return code {{ cpsrvd_restart_return_code }}
+          when:
+            - upcp_binary_stat.stat.exists
+            - upcp_result.rc | default(1) | int == 0
+            - cpsrvd_restart_status == "FAILED"
+
+        # ====================================================
+        # Per-server report
+        # ====================================================
+
+        - name: Display final cPanel server result
+          ansible.builtin.debug:
+            msg:
+              - "============================================================"
+              - "                 CPANEL SERVER RESULT"
+              - "============================================================"
+              - "Host                    : {{ inventory_hostname }}"
+              - "IP                      : {{ ansible_default_ipv4.address | default('Unknown') }}"
+              - "OS                      : {{ ansible_distribution }} {{ ansible_distribution_version }}"
+              - ""
+              - "cPanel Installed        : YES"
+              - "Version Before          : {{ cpanel_version_before }}"
+              - "Version After           : {{ cpanel_version_after }}"
+              - ""
+              - "cpupdate Before         : {{ cpupdate_before }}"
+              - "cpupdate After          : {{ cpupdate_after }}"
+              - "cpupdate Modified       : {{ cpupdate_modified }}"
+              - ""
+              - "upcp Return Code        : {{ upcp_return_code }}"
+              - "cpsrvd Restart Status   : {{ cpsrvd_restart_status }}"
+              - "cpsrvd Restart RC       : {{ cpsrvd_restart_return_code }}"
+              - ""
+              - "FINAL STATUS            : {{ update_status }}"
+              - "Message                 : {{ update_message }}"
+              - "============================================================"
+
+        # ====================================================
+        # Failure diagnostic information
+        # ====================================================
+
+        - name: Display upcp failure diagnostic output
+          ansible.builtin.debug:
+            msg:
+              - "============================================================"
+              - "UPCP FAILURE DETAILS"
+              - "============================================================"
+              - "Host: {{ inventory_hostname }}"
+              - ""
+              - "STDERR:"
+              - "{{ upcp_stderr | default('No stderr returned') }}"
+              - ""
+              - "Last 20 lines of updater output:"
+              - "{{ upcp_stdout_tail | default([]) }}"
+              - "============================================================"
+          when:
+            - upcp_binary_stat.stat.exists
+            - upcp_result.rc | default(1) | int != 0
+
+        - name: Display cpsrvd restart failure details
+          ansible.builtin.debug:
+            msg:
+              - "============================================================"
+              - "CPSRVD RESTART FAILURE DETAILS"
+              - "============================================================"
+              - "Host       : {{ inventory_hostname }}"
+              - "Return Code: {{ cpsrvd_restart_return_code }}"
+              - "STDOUT     : {{ cpsrvd_restart_stdout }}"
+              - "STDERR     : {{ cpsrvd_restart_stderr }}"
+              - "============================================================"
+          when:
+            - cpsrvd_restart_status == "FAILED"
+
+      # ======================================================
+      # Catch unexpected Ansible errors
+      # ======================================================
+
+      rescue:
+
+        - name: Record unexpected processing failure
+          ansible.builtin.set_fact:
+            update_status: "FAILED"
+            update_message: >-
+              Unexpected Ansible failure:
+              {{ ansible_failed_result.msg | default('Unknown error') }}
+
+        - name: Display unexpected processing failure
+          ansible.builtin.debug:
+            msg:
+              - "===================================================="
+              - "Host   : {{ inventory_hostname }}"
+              - "Status : FAILED"
+              - "Reason : {{ update_message }}"
+              - "===================================================="
+
+
+# ============================================================
+# Consolidated Fleet Report
+# ============================================================
+
+- name: Generate consolidated cPanel fleet report
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    target_hosts: "{{ groups['linux_servers'] | default([]) }}"
+
+  tasks:
+
+    # ========================================================
+    # Initialize report categories
+    # ========================================================
+
+    - name: Initialize fleet report categories
+      ansible.builtin.set_fact:
+        successful_hosts: []
+        failed_hosts: []
+        no_cpanel_hosts: []
+        unprocessed_hosts: []
+
+    # ========================================================
+    # Categorize servers
+    # ========================================================
+
+    - name: Build fleet report categories
+      ansible.builtin.set_fact:
+
+        successful_hosts: >-
+          {{
+            successful_hosts +
+            (
+              [item]
+              if (hostvars[item].update_status | default('UNKNOWN')) == 'SUCCESS'
+              else []
+            )
+          }}
+
+        failed_hosts: >-
+          {{
+            failed_hosts +
+            (
+              [item]
+              if (hostvars[item].update_status | default('UNKNOWN')) == 'FAILED'
+              else []
+            )
+          }}
+
+        no_cpanel_hosts: >-
+          {{
+            no_cpanel_hosts +
+            (
+              [item]
+              if (hostvars[item].update_status | default('UNKNOWN')) == 'NO_CPANEL'
+              else []
+            )
+          }}
+
+        unprocessed_hosts: >-
+          {{
+            unprocessed_hosts +
+            (
+              [item]
+              if (hostvars[item].update_status | default('UNKNOWN')) not in
+                 ['SUCCESS', 'FAILED', 'NO_CPANEL']
+              else []
+            )
+          }}
+
+      loop: "{{ target_hosts }}"
+
+    # ========================================================
+    # Overall Fleet Summary
+    # ========================================================
+
+    - name: Display fleet summary
+      ansible.builtin.debug:
+        msg:
+          - "============================================================"
+          - "               CPANEL FLEET UPDATE SUMMARY"
+          - "============================================================"
+          - "Total Servers           : {{ target_hosts | length }}"
+          - ""
+          - "Successful Updates      : {{ successful_hosts | length }}"
+          - "Failed Updates          : {{ failed_hosts | length }}"
+          - "Without cPanel          : {{ no_cpanel_hosts | length }}"
+          - "Unprocessed/Unreachable : {{ unprocessed_hosts | length }}"
+          - ""
+          - "------------------------------------------------------------"
+          - "SUCCESS:"
+          - "{{ successful_hosts | join(', ') if successful_hosts else 'None' }}"
+          - ""
+          - "FAILED:"
+          - "{{ failed_hosts | join(', ') if failed_hosts else 'None' }}"
+          - ""
+          - "NO CPANEL:"
+          - "{{ no_cpanel_hosts | join(', ') if no_cpanel_hosts else 'None' }}"
+          - ""
+          - "UNPROCESSED / UNREACHABLE:"
+          - "{{ unprocessed_hosts | join(', ') if unprocessed_hosts else 'None' }}"
+          - "============================================================"
+
+    # ========================================================
+    # Detailed report for every server
+    # ========================================================
+
+    - name: Display detailed server report
+      ansible.builtin.debug:
+        msg:
+          - "------------------------------------------------------------"
+          - "Server                 : {{ item }}"
+          - "IP                     : {{ hostvars[item].ansible_default_ipv4.address | default('N/A') }}"
+          - "OS                     : {{ hostvars[item].ansible_distribution | default('N/A') }} {{ hostvars[item].ansible_distribution_version | default('') }}"
+          - ""
+          - "cPanel Installed       : {{ hostvars[item].cpanel_installed | default('UNKNOWN') }}"
+          - "Version Before         : {{ hostvars[item].cpanel_version_before | default('N/A') }}"
+          - "Version After          : {{ hostvars[item].cpanel_version_after | default('N/A') }}"
+          - ""
+          - "cpupdate Before        : {{ hostvars[item].cpupdate_before | default('N/A') }}"
+          - "cpupdate After         : {{ hostvars[item].cpupdate_after | default('N/A') }}"
+          - "cpupdate Modified      : {{ hostvars[item].cpupdate_modified | default(false) }}"
+          - ""
+          - "upcp Return Code       : {{ hostvars[item].upcp_return_code | default('N/A') }}"
+          - "cpsrvd Restart Status  : {{ hostvars[item].cpsrvd_restart_status | default('N/A') }}"
+          - "cpsrvd Restart RC      : {{ hostvars[item].cpsrvd_restart_return_code | default('N/A') }}"
+          - ""
+          - "FINAL STATUS           : {{ hostvars[item].update_status | default('UNREACHABLE_OR_NOT_PROCESSED') }}"
+          - "Message                : {{ hostvars[item].update_message | default('Host could not be processed') }}"
+          - "------------------------------------------------------------"
+
+      loop: "{{ target_hosts }}"
