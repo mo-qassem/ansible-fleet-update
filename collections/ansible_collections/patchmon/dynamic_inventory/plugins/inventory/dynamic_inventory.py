@@ -14,15 +14,15 @@ DOCUMENTATION = r"""
         - Linux hosts are placed in linux_hosts.
         - Managed Linux hosts are additionally placed in managed_hosts.
         - A managed Linux host must belong to at least one PatchMon host group:
-          Basic, Advanced, Professional, or Exa.
+            Basic, Advanced, Professional, or Exa.
         - Linux hosts belonging only to groups such as Proxmox remain in
-          linux_hosts and are not added to managed_hosts.
+            linux_hosts and are not added to managed_hosts.
         - Hosts with missing or unknown os_type are placed in unknown_os_hosts.
         - PatchMon host_groups are saved as host variables and are not created
-          as Ansible inventory groups.
+            as Ansible inventory groups.
         - Credentials are read from AWX environment variables.
         - Do NOT use Jinja2 lookup() in the inventory config file because AWX
-          inventory source sync does not process it the same way as a playbook.
+            inventory source sync does not process it the same way as a playbook.
     options:
         plugin:
             description: Plugin identifier.
