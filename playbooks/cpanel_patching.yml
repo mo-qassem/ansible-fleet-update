@@ -16,7 +16,7 @@
 # ============================================================
 
 - name: Audit and update cPanel servers
-  hosts: linux_hosts
+  hosts: managed_hosts
   become: true
   gather_facts: true
   serial: 3
