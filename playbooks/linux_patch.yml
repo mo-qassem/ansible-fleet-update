@@ -1,70 +1,812 @@
 ---
-- name: Linux patch
+# ============================================================
+# Linux Fleet Package Update + Reporting
+# ============================================================
+#
+# Supports:
+#   - Debian / Ubuntu (APT)
+#   - RHEL / AlmaLinux / Rocky / Oracle Linux (DNF/YUM)
+#
+# Workflow:
+#   1. Collect host information
+#   2. Detect available package updates
+#   3. Display updates before patching
+#   4. Apply package updates
+#   5. Check remaining updates
+#   6. Check reboot requirement
+#   7. Produce per-server report
+#   8. Produce consolidated fleet report
+#
+# ============================================================
+
+- name: Linux package patching
   hosts: linux_hosts
   become: true
   gather_facts: true
+
+  # Patch only 3 servers at a time
   serial: 3
 
   vars:
     reboot_allowed: false
-    patch_log_dir:  /var/log/awx-patching
+    patch_log_dir: "/var/log/awx-patching"
+
+  # ==========================================================
+  # Pre Tasks
+  # ==========================================================
 
   pre_tasks:
+
+    - name: Initialize patch report
+      ansible.builtin.set_fact:
+        patch_status: "NOT_PROCESSED"
+        patch_message: "Server has not been processed yet"
+
+        updates_before_count: 0
+        updates_after_count: 0
+
+        updates_before: []
+        updates_after: []
+
+        packages_changed: []
+        packages_changed_count: 0
+
+        patch_return_code: "N/A"
+        patch_error: ""
+
+        reboot_required: false
+        reboot_reason: "Not checked"
+
     - name: Create patch log directory
       ansible.builtin.file:
-        path:  "{{ patch_log_dir }}"
+        path: "{{ patch_log_dir }}"
         state: directory
         owner: root
         group: root
-        mode:  "0750"
-      tags: [always]
+        mode: "0750"
 
-    - name: Show host info
+    - name: Display host information
       ansible.builtin.debug:
-        msg: >-
-          {{ inventory_hostname }} |
-          group(s): {{ group_names | join(', ') }} |
-          {{ ansible_distribution }} {{ ansible_distribution_version }} |
-          pkg_mgr: {{ ansible_pkg_mgr }}
-      tags: [always]
+        msg:
+          - "===================================================="
+          - "Host            : {{ inventory_hostname }}"
+          - "IP              : {{ ansible_default_ipv4.address | default('Unknown') }}"
+          - "Groups          : {{ group_names | join(', ') }}"
+          - "OS              : {{ ansible_distribution }} {{ ansible_distribution_version }}"
+          - "OS Family       : {{ ansible_os_family }}"
+          - "Package Manager : {{ ansible_pkg_mgr }}"
+          - "Kernel          : {{ ansible_kernel }}"
+          - "===================================================="
+
+  # ==========================================================
+  # Main Tasks
+  # ==========================================================
 
   tasks:
 
-    # ── Package updates ───────────────────────────────────────────────────────
+    - name: Patch Linux server
+      block:
 
-    - name: APT — refresh cache
-      ansible.builtin.apt:
-        update_cache:     true
-        cache_valid_time: 0
-      when: ansible_os_family == "Debian"
-      tags: [packages]
+        # ====================================================
+        # Debian / Ubuntu
+        # ====================================================
 
-    - name: APT — dist-upgrade
-      ansible.builtin.apt:
-        upgrade:      dist
-        autoremove:   true
-        autoclean:    true
-        dpkg_options: "force-confdef,force-confold"
-      when: ansible_os_family == "Debian"
-      tags: [packages]
+        - name: Refresh APT package cache
+          ansible.builtin.apt:
+            update_cache: true
+            cache_valid_time: 0
+          when:
+            - ansible_os_family == "Debian"
 
-    - name: DNF — upgrade all packages
-      ansible.builtin.dnf:
-        name:         "*"
-        state:        latest
-        update_cache: true
-        update_only:  true
-      when:
-        - ansible_os_family == "RedHat"
-        - ansible_pkg_mgr in ["dnf", "dnf5"]
-      tags: [packages]
+        # ----------------------------------------------------
+        # Get available updates BEFORE patching
+        # ----------------------------------------------------
 
-    - name: YUM — upgrade all packages
-      ansible.builtin.yum:
-        name:         "*"
-        state:        latest
-        update_cache: true
-      when:
-        - ansible_os_family == "RedHat"
-        - ansible_pkg_mgr == "yum"
-      tags: [packages]
+        - name: Get available APT updates before patching
+          ansible.builtin.shell: |
+            set -o pipefail
+
+            apt list --upgradable 2>/dev/null \
+            | tail -n +2 \
+            | sed '/^[[:space:]]*$/d'
+          args:
+            executable: /bin/bash
+          register: apt_updates_before
+          changed_when: false
+          failed_when: false
+          when:
+            - ansible_os_family == "Debian"
+
+        - name: Store APT updates before patching
+          ansible.builtin.set_fact:
+            updates_before: "{{ apt_updates_before.stdout_lines | default([]) }}"
+            updates_before_count: "{{ apt_updates_before.stdout_lines | default([]) | length }}"
+          when:
+            - ansible_os_family == "Debian"
+
+        # ====================================================
+        # RedHat / AlmaLinux / Rocky / Oracle Linux
+        # ====================================================
+
+        - name: Refresh DNF cache
+          ansible.builtin.command:
+            argv:
+              - dnf
+              - makecache
+              - "--refresh"
+          register: dnf_cache_result
+          changed_when: false
+          failed_when: false
+          when:
+            - ansible_os_family == "RedHat"
+            - ansible_pkg_mgr in ["dnf", "dnf5"]
+
+        - name: Refresh YUM cache
+          ansible.builtin.command:
+            argv:
+              - yum
+              - makecache
+          register: yum_cache_result
+          changed_when: false
+          failed_when: false
+          when:
+            - ansible_os_family == "RedHat"
+            - ansible_pkg_mgr == "yum"
+
+        # ----------------------------------------------------
+        # Check available DNF updates before patching
+        #
+        # dnf check-update returns:
+        #   0   = no updates
+        #   100 = updates available
+        # ----------------------------------------------------
+
+        - name: Get available DNF updates before patching
+          ansible.builtin.shell: |
+            set +e
+
+            dnf -q check-update
+            rc=$?
+
+            if [ "$rc" -eq 0 ] || [ "$rc" -eq 100 ]; then
+                exit 0
+            fi
+
+            exit "$rc"
+          args:
+            executable: /bin/bash
+          register: dnf_updates_before
+          changed_when: false
+          failed_when: false
+          when:
+            - ansible_os_family == "RedHat"
+            - ansible_pkg_mgr in ["dnf", "dnf5"]
+
+        - name: Get available YUM updates before patching
+          ansible.builtin.shell: |
+            set +e
+
+            yum -q check-update
+            rc=$?
+
+            if [ "$rc" -eq 0 ] || [ "$rc" -eq 100 ]; then
+                exit 0
+            fi
+
+            exit "$rc"
+          args:
+            executable: /bin/bash
+          register: yum_updates_before
+          changed_when: false
+          failed_when: false
+          when:
+            - ansible_os_family == "RedHat"
+            - ansible_pkg_mgr == "yum"
+
+        - name: Store DNF updates before patching
+          ansible.builtin.set_fact:
+            updates_before: >-
+              {{
+                dnf_updates_before.stdout_lines
+                | default([])
+                | reject('match', '^Last metadata expiration')
+                | reject('match', '^$')
+                | list
+              }}
+          when:
+            - ansible_os_family == "RedHat"
+            - ansible_pkg_mgr in ["dnf", "dnf5"]
+
+        - name: Store YUM updates before patching
+          ansible.builtin.set_fact:
+            updates_before: >-
+              {{
+                yum_updates_before.stdout_lines
+                | default([])
+                | reject('match', '^Loaded plugins')
+                | reject('match', '^$')
+                | list
+              }}
+          when:
+            - ansible_os_family == "RedHat"
+            - ansible_pkg_mgr == "yum"
+
+        - name: Count updates before patching
+          ansible.builtin.set_fact:
+            updates_before_count: "{{ updates_before | length }}"
+          when:
+            - ansible_os_family == "RedHat"
+
+        # ====================================================
+        # Display pending packages
+        # ====================================================
+
+        - name: Display updates before patching
+          ansible.builtin.debug:
+            msg:
+              - "===================================================="
+              - "PACKAGES BEFORE PATCHING"
+              - "===================================================="
+              - "Host             : {{ inventory_hostname }}"
+              - "Available Updates: {{ updates_before_count }}"
+              - ""
+              - "{{ updates_before if updates_before_count | int > 0 else ['No package updates currently available'] }}"
+              - "===================================================="
+
+        # ====================================================
+        # Apply Debian updates
+        # ====================================================
+
+        - name: APT dist-upgrade
+          ansible.builtin.apt:
+            upgrade: dist
+            autoremove: true
+            autoclean: true
+            dpkg_options: "force-confdef,force-confold"
+          register: apt_upgrade_result
+          failed_when: false
+          when:
+            - ansible_os_family == "Debian"
+
+        - name: Store APT patch result
+          ansible.builtin.set_fact:
+            packages_changed: >-
+              {{
+                apt_upgrade_result.stdout_lines
+                | default([])
+                | select('search', 'upgraded')
+                | list
+              }}
+            patch_return_code: >-
+              {{
+                0
+                if not (apt_upgrade_result.failed | default(false))
+                else 1
+              }}
+            patch_error: "{{ apt_upgrade_result.stderr | default('') | trim }}"
+          when:
+            - ansible_os_family == "Debian"
+
+        # ====================================================
+        # Apply DNF updates
+        # ====================================================
+
+        - name: DNF upgrade all packages
+          ansible.builtin.dnf:
+            name: "*"
+            state: latest
+            update_cache: true
+            update_only: true
+          register: dnf_upgrade_result
+          failed_when: false
+          when:
+            - ansible_os_family == "RedHat"
+            - ansible_pkg_mgr in ["dnf", "dnf5"]
+
+        - name: Store DNF patch result
+          ansible.builtin.set_fact:
+            packages_changed: "{{ dnf_upgrade_result.results | default([]) }}"
+            patch_return_code: >-
+              {{
+                0
+                if not (dnf_upgrade_result.failed | default(false))
+                else 1
+              }}
+            patch_error: "{{ dnf_upgrade_result.msg | default('') }}"
+          when:
+            - ansible_os_family == "RedHat"
+            - ansible_pkg_mgr in ["dnf", "dnf5"]
+
+        # ====================================================
+        # Apply YUM updates
+        # ====================================================
+
+        - name: YUM upgrade all packages
+          ansible.builtin.yum:
+            name: "*"
+            state: latest
+            update_cache: true
+          register: yum_upgrade_result
+          failed_when: false
+          when:
+            - ansible_os_family == "RedHat"
+            - ansible_pkg_mgr == "yum"
+
+        - name: Store YUM patch result
+          ansible.builtin.set_fact:
+            packages_changed: "{{ yum_upgrade_result.results | default([]) }}"
+            patch_return_code: >-
+              {{
+                0
+                if not (yum_upgrade_result.failed | default(false))
+                else 1
+              }}
+            patch_error: "{{ yum_upgrade_result.msg | default('') }}"
+          when:
+            - ansible_os_family == "RedHat"
+            - ansible_pkg_mgr == "yum"
+
+        # ====================================================
+        # Count changed packages
+        # ====================================================
+
+        - name: Store changed package count
+          ansible.builtin.set_fact:
+            packages_changed_count: "{{ packages_changed | length }}"
+
+        # ====================================================
+        # Refresh caches after patching
+        # ====================================================
+
+        - name: Refresh APT cache after update
+          ansible.builtin.apt:
+            update_cache: true
+            cache_valid_time: 0
+          failed_when: false
+          when:
+            - ansible_os_family == "Debian"
+
+        # ====================================================
+        # Check remaining APT updates
+        # ====================================================
+
+        - name: Get remaining APT updates
+          ansible.builtin.shell: |
+            set -o pipefail
+
+            apt list --upgradable 2>/dev/null \
+            | tail -n +2 \
+            | sed '/^[[:space:]]*$/d'
+          args:
+            executable: /bin/bash
+          register: apt_updates_after
+          changed_when: false
+          failed_when: false
+          when:
+            - ansible_os_family == "Debian"
+
+        - name: Store remaining APT updates
+          ansible.builtin.set_fact:
+            updates_after: "{{ apt_updates_after.stdout_lines | default([]) }}"
+            updates_after_count: "{{ apt_updates_after.stdout_lines | default([]) | length }}"
+          when:
+            - ansible_os_family == "Debian"
+
+        # ====================================================
+        # Check remaining DNF updates
+        # ====================================================
+
+        - name: Get remaining DNF updates
+          ansible.builtin.shell: |
+            set +e
+
+            dnf -q check-update
+            rc=$?
+
+            if [ "$rc" -eq 0 ] || [ "$rc" -eq 100 ]; then
+                exit 0
+            fi
+
+            exit "$rc"
+          args:
+            executable: /bin/bash
+          register: dnf_updates_after
+          changed_when: false
+          failed_when: false
+          when:
+            - ansible_os_family == "RedHat"
+            - ansible_pkg_mgr in ["dnf", "dnf5"]
+
+        - name: Store remaining DNF updates
+          ansible.builtin.set_fact:
+            updates_after: >-
+              {{
+                dnf_updates_after.stdout_lines
+                | default([])
+                | reject('match', '^Last metadata expiration')
+                | reject('match', '^$')
+                | list
+              }}
+          when:
+            - ansible_os_family == "RedHat"
+            - ansible_pkg_mgr in ["dnf", "dnf5"]
+
+        # ====================================================
+        # Check remaining YUM updates
+        # ====================================================
+
+        - name: Get remaining YUM updates
+          ansible.builtin.shell: |
+            set +e
+
+            yum -q check-update
+            rc=$?
+
+            if [ "$rc" -eq 0 ] || [ "$rc" -eq 100 ]; then
+                exit 0
+            fi
+
+            exit "$rc"
+          args:
+            executable: /bin/bash
+          register: yum_updates_after
+          changed_when: false
+          failed_when: false
+          when:
+            - ansible_os_family == "RedHat"
+            - ansible_pkg_mgr == "yum"
+
+        - name: Store remaining YUM updates
+          ansible.builtin.set_fact:
+            updates_after: >-
+              {{
+                yum_updates_after.stdout_lines
+                | default([])
+                | reject('match', '^Loaded plugins')
+                | reject('match', '^$')
+                | list
+              }}
+          when:
+            - ansible_os_family == "RedHat"
+            - ansible_pkg_mgr == "yum"
+
+        - name: Count remaining RedHat updates
+          ansible.builtin.set_fact:
+            updates_after_count: "{{ updates_after | length }}"
+          when:
+            - ansible_os_family == "RedHat"
+
+        # ====================================================
+        # Check reboot requirement - Debian
+        # ====================================================
+
+        - name: Check Debian reboot requirement
+          ansible.builtin.stat:
+            path: /var/run/reboot-required
+          register: debian_reboot_file
+          when:
+            - ansible_os_family == "Debian"
+
+        - name: Store Debian reboot requirement
+          ansible.builtin.set_fact:
+            reboot_required: "{{ debian_reboot_file.stat.exists | default(false) }}"
+            reboot_reason: >-
+              {{
+                'Reboot required according to /var/run/reboot-required'
+                if (debian_reboot_file.stat.exists | default(false))
+                else 'No reboot required'
+              }}
+          when:
+            - ansible_os_family == "Debian"
+
+        # ====================================================
+        # Check reboot recommendation - RedHat
+        # ====================================================
+
+        - name: Check whether needs-restarting command exists
+          ansible.builtin.shell: |
+            command -v needs-restarting || true
+          args:
+            executable: /bin/bash
+          register: needs_restarting_binary
+          changed_when: false
+          when:
+            - ansible_os_family == "RedHat"
+
+        - name: Check RedHat reboot requirement
+          ansible.builtin.command:
+            argv:
+              - needs-restarting
+              - "-r"
+          register: needs_restarting_result
+          changed_when: false
+          failed_when: false
+          when:
+            - ansible_os_family == "RedHat"
+            - needs_restarting_binary.stdout | trim | length > 0
+
+        - name: Store RedHat reboot requirement
+          ansible.builtin.set_fact:
+            reboot_required: "{{ needs_restarting_result.rc | default(0) | int != 0 }}"
+            reboot_reason: >-
+              {{
+                'Reboot recommended by needs-restarting'
+                if (needs_restarting_result.rc | default(0) | int != 0)
+                else 'No reboot required'
+              }}
+          when:
+            - ansible_os_family == "RedHat"
+            - needs_restarting_binary.stdout | trim | length > 0
+
+        - name: Handle missing needs-restarting
+          ansible.builtin.set_fact:
+            reboot_required: false
+            reboot_reason: "Unable to determine - needs-restarting is not installed"
+          when:
+            - ansible_os_family == "RedHat"
+            - needs_restarting_binary.stdout | trim | length == 0
+
+        # ====================================================
+        # Optional reboot
+        # ====================================================
+
+        - name: Reboot server when explicitly allowed
+          ansible.builtin.reboot:
+            msg: "Reboot initiated by Ansible after package patching"
+            reboot_timeout: 900
+          when:
+            - reboot_allowed | bool
+            - reboot_required | bool
+
+        # ====================================================
+        # Determine final patch status
+        # ====================================================
+
+        - name: Mark patch operation successful
+          ansible.builtin.set_fact:
+            patch_status: "SUCCESS"
+            patch_message: >-
+              Package update completed successfully.
+              Updates before: {{ updates_before_count }}.
+              Updates remaining: {{ updates_after_count }}.
+          when:
+            - patch_return_code | int == 0
+            - updates_after_count | int == 0
+
+        - name: Mark patch successful with remaining packages
+          ansible.builtin.set_fact:
+            patch_status: "SUCCESS_WITH_REMAINING_UPDATES"
+            patch_message: >-
+              Package update completed, but
+              {{ updates_after_count }} package update(s) are still available.
+          when:
+            - patch_return_code | int == 0
+            - updates_after_count | int > 0
+
+        - name: Mark patch operation failed
+          ansible.builtin.set_fact:
+            patch_status: "FAILED"
+            patch_message: >-
+              Package update operation failed.
+              {{ patch_error | default('No additional error information') }}
+          when:
+            - patch_return_code | int != 0
+
+        # ====================================================
+        # Per-server report
+        # ====================================================
+
+        - name: Display final package update report
+          ansible.builtin.debug:
+            msg:
+              - "============================================================"
+              - "                PACKAGE PATCH REPORT"
+              - "============================================================"
+              - "Host                     : {{ inventory_hostname }}"
+              - "IP                       : {{ ansible_default_ipv4.address | default('Unknown') }}"
+              - "OS                       : {{ ansible_distribution }} {{ ansible_distribution_version }}"
+              - "Kernel                   : {{ ansible_kernel }}"
+              - "Package Manager          : {{ ansible_pkg_mgr }}"
+              - ""
+              - "Updates Before           : {{ updates_before_count }}"
+              - "Packages Changed/Results : {{ packages_changed_count }}"
+              - "Updates Remaining        : {{ updates_after_count }}"
+              - ""
+              - "Reboot Required          : {{ reboot_required }}"
+              - "Reboot Status            : {{ reboot_reason }}"
+              - "Automatic Reboot Allowed : {{ reboot_allowed }}"
+              - ""
+              - "FINAL STATUS             : {{ patch_status }}"
+              - "Message                  : {{ patch_message }}"
+              - "============================================================"
+
+        # ====================================================
+        # Display remaining updates only when present
+        # ====================================================
+
+        - name: Display packages still requiring updates
+          ansible.builtin.debug:
+            msg:
+              - "============================================================"
+              - "REMAINING PACKAGE UPDATES"
+              - "============================================================"
+              - "Host: {{ inventory_hostname }}"
+              - ""
+              - "{{ updates_after }}"
+              - "============================================================"
+          when:
+            - updates_after_count | int > 0
+
+      # ======================================================
+      # Catch unexpected Ansible-side errors
+      # ======================================================
+
+      rescue:
+
+        - name: Record unexpected patching failure
+          ansible.builtin.set_fact:
+            patch_status: "FAILED"
+            patch_message: >-
+              Unexpected Ansible failure:
+              {{ ansible_failed_result.msg | default('Unknown error') }}
+
+        - name: Display unexpected patch failure
+          ansible.builtin.debug:
+            msg:
+              - "============================================================"
+              - "PACKAGE PATCHING FAILED"
+              - "============================================================"
+              - "Host   : {{ inventory_hostname }}"
+              - "Status : FAILED"
+              - "Reason : {{ patch_message }}"
+              - "============================================================"
+
+
+# ============================================================
+# Consolidated Fleet Report
+# ============================================================
+
+- name: Generate consolidated Linux patch report
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    target_hosts: "{{ groups['linux_hosts'] | default([]) }}"
+
+  tasks:
+
+    # ========================================================
+    # Initialize categories
+    # ========================================================
+
+    - name: Initialize fleet report
+      ansible.builtin.set_fact:
+        successful_hosts: []
+        success_with_remaining_hosts: []
+        failed_hosts: []
+        reboot_required_hosts: []
+        unprocessed_hosts: []
+
+    # ========================================================
+    # Build fleet categories
+    # ========================================================
+
+    - name: Categorize patched servers
+      ansible.builtin.set_fact:
+
+        successful_hosts: >-
+          {{
+            successful_hosts +
+            (
+              [item]
+              if (hostvars[item].patch_status | default('UNKNOWN')) == 'SUCCESS'
+              else []
+            )
+          }}
+
+        success_with_remaining_hosts: >-
+          {{
+            success_with_remaining_hosts +
+            (
+              [item]
+              if
+                (hostvars[item].patch_status | default('UNKNOWN'))
+                == 'SUCCESS_WITH_REMAINING_UPDATES'
+              else []
+            )
+          }}
+
+        failed_hosts: >-
+          {{
+            failed_hosts +
+            (
+              [item]
+              if (hostvars[item].patch_status | default('UNKNOWN')) == 'FAILED'
+              else []
+            )
+          }}
+
+        reboot_required_hosts: >-
+          {{
+            reboot_required_hosts +
+            (
+              [item]
+              if (hostvars[item].reboot_required | default(false) | bool)
+              else []
+            )
+          }}
+
+        unprocessed_hosts: >-
+          {{
+            unprocessed_hosts +
+            (
+              [item]
+              if (hostvars[item].patch_status | default('UNKNOWN')) not in
+                 ['SUCCESS', 'SUCCESS_WITH_REMAINING_UPDATES', 'FAILED']
+              else []
+            )
+          }}
+
+      loop: "{{ target_hosts }}"
+
+    # ========================================================
+    # Overall summary
+    # ========================================================
+
+    - name: Display Linux fleet patch summary
+      ansible.builtin.debug:
+        msg:
+          - "============================================================"
+          - "                LINUX FLEET PATCH SUMMARY"
+          - "============================================================"
+          - "Total Servers            : {{ target_hosts | length }}"
+          - ""
+          - "Successful               : {{ successful_hosts | length }}"
+          - "Successful / Remaining   : {{ success_with_remaining_hosts | length }}"
+          - "Failed                   : {{ failed_hosts | length }}"
+          - "Reboot Required          : {{ reboot_required_hosts | length }}"
+          - "Unprocessed/Unreachable  : {{ unprocessed_hosts | length }}"
+          - ""
+          - "------------------------------------------------------------"
+          - "SUCCESS:"
+          - "{{ successful_hosts | join(', ') if successful_hosts else 'None' }}"
+          - ""
+          - "SUCCESS WITH REMAINING UPDATES:"
+          - "{{ success_with_remaining_hosts | join(', ') if success_with_remaining_hosts else 'None' }}"
+          - ""
+          - "FAILED:"
+          - "{{ failed_hosts | join(', ') if failed_hosts else 'None' }}"
+          - ""
+          - "REBOOT REQUIRED:"
+          - "{{ reboot_required_hosts | join(', ') if reboot_required_hosts else 'None' }}"
+          - ""
+          - "UNPROCESSED / UNREACHABLE:"
+          - "{{ unprocessed_hosts | join(', ') if unprocessed_hosts else 'None' }}"
+          - "============================================================"
+
+    # ========================================================
+    # Detailed server summary
+    # ========================================================
+
+    - name: Display detailed fleet report
+      ansible.builtin.debug:
+        msg:
+          - "------------------------------------------------------------"
+          - "Server            : {{ item }}"
+          - "IP                : {{ hostvars[item].ansible_default_ipv4.address | default('N/A') }}"
+          - "OS                : {{ hostvars[item].ansible_distribution | default('N/A') }} {{ hostvars[item].ansible_distribution_version | default('') }}"
+          - "Package Manager   : {{ hostvars[item].ansible_pkg_mgr | default('N/A') }}"
+          - "Kernel            : {{ hostvars[item].ansible_kernel | default('N/A') }}"
+          - ""
+          - "Updates Before    : {{ hostvars[item].updates_before_count | default('N/A') }}"
+          - "Packages Changed  : {{ hostvars[item].packages_changed_count | default('N/A') }}"
+          - "Updates Remaining : {{ hostvars[item].updates_after_count | default('N/A') }}"
+          - ""
+          - "Reboot Required   : {{ hostvars[item].reboot_required | default('N/A') }}"
+          - "Reboot Reason     : {{ hostvars[item].reboot_reason | default('N/A') }}"
+          - ""
+          - "FINAL STATUS      : {{ hostvars[item].patch_status | default('UNREACHABLE_OR_NOT_PROCESSED') }}"
+          - "Message           : {{ hostvars[item].patch_message | default('Host could not be processed') }}"
+          - "------------------------------------------------------------"
+
+      loop: "{{ target_hosts }}"

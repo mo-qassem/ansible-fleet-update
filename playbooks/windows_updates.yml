@@ -1,36 +1,708 @@
 ---
+# ============================================================
+# Windows Fleet Security Update + Reporting
+# ============================================================
+#
+# Workflow:
+#   1. Verify WinRM connectivity
+#   2. Collect Windows system information
+#   3. Search for applicable updates BEFORE patching
+#   4. Display pending updates
+#   5. Install selected Windows Update categories
+#   6. Reboot automatically if allowed/required
+#   7. Search again AFTER patching
+#   8. Determine final server status
+#   9. Produce per-server report
+#  10. Produce consolidated fleet report
+#
+# Categories:
+#   - CriticalUpdates
+#   - SecurityUpdates
+#   - UpdateRollups
+#
+# ============================================================
+
 - name: Windows security updates
   hosts: windows_hosts
   gather_facts: false
-  serial: "{{ batch_size | default(3) }}"
+  serial: 3
 
   vars:
+
+    # --------------------------------------------------------
+    # Reboot behavior
+    # --------------------------------------------------------
+
     windows_reboot: true
+    windows_reboot_timeout: 3600
+
+    # --------------------------------------------------------
+    # Windows Update categories
+    # --------------------------------------------------------
+
     windows_update_categories:
       - CriticalUpdates
       - SecurityUpdates
       - UpdateRollups
 
+    # --------------------------------------------------------
+    # Log file on Windows server
+    # --------------------------------------------------------
+
+    windows_update_log: 'C:\Windows\Temp\awx-windows-updates.log'
+
   tasks:
 
-    - name: Ping Windows hosts
-      ansible.windows.win_ping:
+    # ========================================================
+    # Initialize reporting variables
+    # ========================================================
 
-    - name: Install Windows updates
-      ansible.windows.win_updates:
-        category_names:  "{{ windows_update_categories }}"
-        reboot:          "{{ windows_reboot | bool }}"
-        reboot_timeout:  3600
-        log_path:        C:\Windows\Temp\awx-windows-updates.log
-      register: win_result
+    - name: Initialize Windows patch report
+      ansible.builtin.set_fact:
+        windows_patch_status: "NOT_PROCESSED"
+        windows_patch_message: "Server has not been processed yet"
 
-    - name: Summary
+        windows_connectivity: "UNKNOWN"
+
+        windows_caption: "N/A"
+        windows_version: "N/A"
+        windows_build: "N/A"
+
+        updates_before_count: 0
+        updates_before: []
+
+        updates_installed_count: 0
+        updates_failed_count: 0
+
+        updates_after_count: 0
+        updates_after: []
+
+        reboot_required: false
+        rebooted: false
+
+        update_failure_message: ""
+
+    # ========================================================
+    # Process Windows host
+    # ========================================================
+
+    - name: Process Windows server
+      block:
+
+        # ====================================================
+        # 1. Verify connectivity
+        # ====================================================
+
+        - name: Ping Windows host
+          ansible.windows.win_ping:
+          register: windows_ping
+
+        - name: Mark Windows connectivity successful
+          ansible.builtin.set_fact:
+            windows_connectivity: "CONNECTED"
+
+        # ====================================================
+        # 2. Collect Windows information
+        # ====================================================
+
+        - name: Collect Windows system information
+          ansible.windows.win_shell: |
+            $os = Get-CimInstance Win32_OperatingSystem
+
+            [PSCustomObject]@{
+                Caption = $os.Caption
+                Version = $os.Version
+                Build   = $os.BuildNumber
+            } | ConvertTo-Json -Compress
+          register: windows_os_result
+          changed_when: false
+
+        - name: Parse Windows system information
+          ansible.builtin.set_fact:
+            windows_os_info: "{{ windows_os_result.stdout | trim | from_json }}"
+
+        - name: Store Windows system information
+          ansible.builtin.set_fact:
+            windows_caption: "{{ windows_os_info.Caption | default('Unknown') }}"
+            windows_version: "{{ windows_os_info.Version | default('Unknown') }}"
+            windows_build: "{{ windows_os_info.Build | default('Unknown') }}"
+
+        - name: Display host information
+          ansible.builtin.debug:
+            msg:
+              - "============================================================"
+              - "WINDOWS HOST INFORMATION"
+              - "============================================================"
+              - "Host          : {{ inventory_hostname }}"
+              - "Groups        : {{ group_names | join(', ') }}"
+              - "OS            : {{ windows_caption }}"
+              - "Version       : {{ windows_version }}"
+              - "Build         : {{ windows_build }}"
+              - "Connectivity  : {{ windows_connectivity }}"
+              - "============================================================"
+
+        # ====================================================
+        # 3. Search updates BEFORE patching
+        # ====================================================
+
+        - name: Search applicable Windows updates before patching
+          ansible.windows.win_updates:
+            category_names: "{{ windows_update_categories }}"
+            state: searched
+          register: updates_before_result
+
+        # ====================================================
+        # Store update information BEFORE patching
+        # ====================================================
+
+        - name: Store pending updates before patching
+          ansible.builtin.set_fact:
+            updates_before_count: >-
+              {{
+                updates_before_result.found_update_count
+                | default(
+                    updates_before_result.updates
+                    | default({})
+                    | length
+                  )
+              }}
+
+            updates_before: >-
+              {{
+                updates_before_result.updates
+                | default({})
+              }}
+
+        # ====================================================
+        # Display pending update count
+        # ====================================================
+
+        - name: Display updates before patching
+          ansible.builtin.debug:
+            msg:
+              - "============================================================"
+              - "WINDOWS UPDATES BEFORE PATCHING"
+              - "============================================================"
+              - "Host            : {{ inventory_hostname }}"
+              - "Updates Found   : {{ updates_before_count }}"
+              - "Categories      : {{ windows_update_categories | join(', ') }}"
+              - "============================================================"
+
+        # ====================================================
+        # Display individual pending updates
+        # ====================================================
+
+        - name: Display pending update details
+          ansible.builtin.debug:
+            msg:
+              - "Update ID : {{ item.key }}"
+              - "Title     : {{ item.value.title | default('Unknown') }}"
+              - "KB        : {{ item.value.kb | default([]) | join(', ') }}"
+              - "Categories: {{ item.value.categories | default([]) | join(', ') }}"
+          loop: "{{ updates_before | dict2items }}"
+          when:
+            - updates_before_count | int > 0
+
+        # ====================================================
+        # 4. Install Windows updates
+        # ====================================================
+
+        - name: Install Windows security updates
+          ansible.windows.win_updates:
+            category_names: "{{ windows_update_categories }}"
+
+            # Automatically reboot if required
+            reboot: "{{ windows_reboot | bool }}"
+
+            reboot_timeout: "{{ windows_reboot_timeout }}"
+
+            log_path: "{{ windows_update_log }}"
+
+            state: installed
+
+          register: win_result
+
+          # We handle update failure ourselves so reporting
+          # continues for other servers.
+          failed_when: false
+
+        # ====================================================
+        # Store installation result
+        # ====================================================
+
+        - name: Store Windows update installation result
+          ansible.builtin.set_fact:
+
+            updates_installed_count: >-
+              {{
+                win_result.installed_update_count
+                | default(0)
+              }}
+
+            updates_failed_count: >-
+              {{
+                win_result.failed_update_count
+                | default(0)
+              }}
+
+            reboot_required: >-
+              {{
+                win_result.reboot_required
+                | default(false)
+              }}
+
+            rebooted: >-
+              {{
+                win_result.rebooted
+                | default(false)
+              }}
+
+            update_failure_message: >-
+              {{
+                win_result.msg
+                | default('')
+              }}
+
+        # ====================================================
+        # Display installation result
+        # ====================================================
+
+        - name: Display Windows Update execution result
+          ansible.builtin.debug:
+            msg:
+              - "============================================================"
+              - "WINDOWS UPDATE EXECUTION"
+              - "============================================================"
+              - "Host               : {{ inventory_hostname }}"
+              - "Found              : {{ win_result.found_update_count | default(updates_before_count) }}"
+              - "Installed          : {{ updates_installed_count }}"
+              - "Failed             : {{ updates_failed_count }}"
+              - "Reboot Required    : {{ reboot_required }}"
+              - "Rebooted           : {{ rebooted }}"
+              - "Automatic Reboot   : {{ windows_reboot }}"
+              - "============================================================"
+
+        # ====================================================
+        # 5. Verify Windows is reachable after update/reboot
+        # ====================================================
+
+        - name: Verify Windows connectivity after patching
+          ansible.windows.win_ping:
+          register: windows_post_update_ping
+          retries: 10
+          delay: 30
+          until: windows_post_update_ping is succeeded
+
+        # ====================================================
+        # 6. Get Windows OS information again
+        #
+        # Useful when a cumulative update changes the build.
+        # ====================================================
+
+        - name: Collect Windows information after patching
+          ansible.windows.win_shell: |
+            $os = Get-CimInstance Win32_OperatingSystem
+
+            [PSCustomObject]@{
+                Caption = $os.Caption
+                Version = $os.Version
+                Build   = $os.BuildNumber
+            } | ConvertTo-Json -Compress
+          register: windows_os_after_result
+          changed_when: false
+
+        - name: Parse Windows information after patching
+          ansible.builtin.set_fact:
+            windows_os_after_info: >-
+              {{
+                windows_os_after_result.stdout
+                | trim
+                | from_json
+              }}
+
+        - name: Store Windows build after patching
+          ansible.builtin.set_fact:
+            windows_build_after: >-
+              {{
+                windows_os_after_info.Build
+                | default(windows_build)
+              }}
+
+        # ====================================================
+        # 7. Search again AFTER patching
+        # ====================================================
+
+        - name: Search remaining Windows updates
+          ansible.windows.win_updates:
+            category_names: "{{ windows_update_categories }}"
+            state: searched
+          register: updates_after_result
+          failed_when: false
+
+        # ====================================================
+        # Store remaining updates
+        # ====================================================
+
+        - name: Store remaining Windows updates
+          ansible.builtin.set_fact:
+
+            updates_after_count: >-
+              {{
+                updates_after_result.found_update_count
+                | default(
+                    updates_after_result.updates
+                    | default({})
+                    | length
+                  )
+              }}
+
+            updates_after: >-
+              {{
+                updates_after_result.updates
+                | default({})
+              }}
+
+        # ====================================================
+        # Display remaining updates
+        # ====================================================
+
+        - name: Display remaining update count
+          ansible.builtin.debug:
+            msg:
+              - "============================================================"
+              - "WINDOWS UPDATES AFTER PATCHING"
+              - "============================================================"
+              - "Host              : {{ inventory_hostname }}"
+              - "Remaining Updates : {{ updates_after_count }}"
+              - "============================================================"
+
+        # ====================================================
+        # Display remaining update details
+        # ====================================================
+
+        - name: Display remaining update details
+          ansible.builtin.debug:
+            msg:
+              - "Update ID : {{ item.key }}"
+              - "Title     : {{ item.value.title | default('Unknown') }}"
+              - "KB        : {{ item.value.kb | default([]) | join(', ') }}"
+          loop: "{{ updates_after | dict2items }}"
+          when:
+            - updates_after_count | int > 0
+
+        # ====================================================
+        # 8. Determine final status
+        # ====================================================
+
+        # ----------------------------------------------------
+        # Complete success
+        # ----------------------------------------------------
+
+        - name: Mark Windows update successful
+          ansible.builtin.set_fact:
+            windows_patch_status: "SUCCESS"
+            windows_patch_message: >-
+              Windows updates completed successfully.
+              Found {{ updates_before_count }} update(s),
+              installed {{ updates_installed_count }},
+              and {{ updates_after_count }} applicable update(s)
+              remain.
+          when:
+            - updates_failed_count | int == 0
+            - updates_after_count | int == 0
+
+        # ----------------------------------------------------
+        # Update worked but some updates remain
+        #
+        # This is not necessarily an error.
+        # Windows frequently requires another patch cycle after
+        # installing servicing stack / cumulative updates.
+        # ----------------------------------------------------
+
+        - name: Mark successful update with remaining updates
+          ansible.builtin.set_fact:
+            windows_patch_status: "SUCCESS_WITH_REMAINING_UPDATES"
+            windows_patch_message: >-
+              Windows Update completed successfully, but
+              {{ updates_after_count }} applicable update(s)
+              remain and may require another update cycle.
+          when:
+            - updates_failed_count | int == 0
+            - updates_after_count | int > 0
+
+        # ----------------------------------------------------
+        # Installation failure
+        # ----------------------------------------------------
+
+        - name: Mark Windows update failed
+          ansible.builtin.set_fact:
+            windows_patch_status: "FAILED"
+            windows_patch_message: >-
+              Windows Update reported
+              {{ updates_failed_count }} failed update(s).
+              {{ update_failure_message }}
+          when:
+            - updates_failed_count | int > 0
+
+        # ====================================================
+        # 9. Per-server final report
+        # ====================================================
+
+        - name: Display final Windows patch report
+          ansible.builtin.debug:
+            msg:
+              - "============================================================"
+              - "                 WINDOWS PATCH REPORT"
+              - "============================================================"
+              - "Host                    : {{ inventory_hostname }}"
+              - "Groups                  : {{ group_names | join(', ') }}"
+              - ""
+              - "OS                      : {{ windows_caption }}"
+              - "OS Version              : {{ windows_version }}"
+              - "Build Before            : {{ windows_build }}"
+              - "Build After             : {{ windows_build_after | default(windows_build) }}"
+              - ""
+              - "Updates Before          : {{ updates_before_count }}"
+              - "Updates Installed       : {{ updates_installed_count }}"
+              - "Updates Failed          : {{ updates_failed_count }}"
+              - "Updates Remaining       : {{ updates_after_count }}"
+              - ""
+              - "Reboot Required         : {{ reboot_required }}"
+              - "Automatic Reboot        : {{ windows_reboot }}"
+              - "Server Rebooted         : {{ rebooted }}"
+              - ""
+              - "FINAL STATUS            : {{ windows_patch_status }}"
+              - "Message                 : {{ windows_patch_message }}"
+              - ""
+              - "Windows Update Log:"
+              - "{{ windows_update_log }}"
+              - "============================================================"
+
+        # ====================================================
+        # Display failure information
+        # ====================================================
+
+        - name: Display Windows Update failure details
+          ansible.builtin.debug:
+            msg:
+              - "============================================================"
+              - "WINDOWS UPDATE FAILURE DETAILS"
+              - "============================================================"
+              - "Host   : {{ inventory_hostname }}"
+              - "Failed : {{ updates_failed_count }}"
+              - "Message: {{ update_failure_message }}"
+              - "============================================================"
+          when:
+            - windows_patch_status == "FAILED"
+
+      # ======================================================
+      # Catch unexpected Ansible / WinRM errors
+      # ======================================================
+
+      rescue:
+
+        - name: Record unexpected Windows patching failure
+          ansible.builtin.set_fact:
+            windows_patch_status: "FAILED"
+            windows_patch_message: >-
+              Unexpected Windows/Ansible failure:
+              {{ ansible_failed_result.msg | default('Unknown error') }}
+
+        - name: Display unexpected Windows failure
+          ansible.builtin.debug:
+            msg:
+              - "============================================================"
+              - "WINDOWS PATCHING FAILED"
+              - "============================================================"
+              - "Host   : {{ inventory_hostname }}"
+              - "Status : FAILED"
+              - "Reason : {{ windows_patch_message }}"
+              - "============================================================"
+
+
+# ============================================================
+# Consolidated Windows Fleet Report
+# ============================================================
+
+- name: Generate consolidated Windows patch report
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    target_hosts: "{{ groups['windows_hosts'] | default([]) }}"
+
+  tasks:
+
+    # ========================================================
+    # Initialize categories
+    # ========================================================
+
+    - name: Initialize Windows fleet report
+      ansible.builtin.set_fact:
+        successful_hosts: []
+        success_with_remaining_hosts: []
+        failed_hosts: []
+        rebooted_hosts: []
+        reboot_required_hosts: []
+        unprocessed_hosts: []
+
+    # ========================================================
+    # Categorize Windows servers
+    # ========================================================
+
+    - name: Categorize Windows servers
+      ansible.builtin.set_fact:
+
+        successful_hosts: >-
+          {{
+            successful_hosts +
+            (
+              [item]
+              if
+                (hostvars[item].windows_patch_status | default('UNKNOWN'))
+                == 'SUCCESS'
+              else []
+            )
+          }}
+
+        success_with_remaining_hosts: >-
+          {{
+            success_with_remaining_hosts +
+            (
+              [item]
+              if
+                (hostvars[item].windows_patch_status | default('UNKNOWN'))
+                == 'SUCCESS_WITH_REMAINING_UPDATES'
+              else []
+            )
+          }}
+
+        failed_hosts: >-
+          {{
+            failed_hosts +
+            (
+              [item]
+              if
+                (hostvars[item].windows_patch_status | default('UNKNOWN'))
+                == 'FAILED'
+              else []
+            )
+          }}
+
+        rebooted_hosts: >-
+          {{
+            rebooted_hosts +
+            (
+              [item]
+              if
+                (hostvars[item].rebooted | default(false) | bool)
+              else []
+            )
+          }}
+
+        reboot_required_hosts: >-
+          {{
+            reboot_required_hosts +
+            (
+              [item]
+              if
+                (
+                  hostvars[item].reboot_required
+                  | default(false)
+                  | bool
+                )
+                and not
+                (
+                  hostvars[item].rebooted
+                  | default(false)
+                  | bool
+                )
+              else []
+            )
+          }}
+
+        unprocessed_hosts: >-
+          {{
+            unprocessed_hosts +
+            (
+              [item]
+              if
+                (hostvars[item].windows_patch_status | default('UNKNOWN'))
+                not in
+                [
+                  'SUCCESS',
+                  'SUCCESS_WITH_REMAINING_UPDATES',
+                  'FAILED'
+                ]
+              else []
+            )
+          }}
+
+      loop: "{{ target_hosts }}"
+
+    # ========================================================
+    # Overall fleet summary
+    # ========================================================
+
+    - name: Display Windows fleet patch summary
       ansible.builtin.debug:
         msg:
-          - "┌─ {{ inventory_hostname }}"
-          - "│  Groups   : {{ group_names | join(', ') }}"
-          - "│  Found    : {{ win_result.found_update_count | default('n/a') }}"
-          - "│  Installed: {{ win_result.installed_update_count | default('n/a') }}"
-          - "│  Failed   : {{ win_result.failed_update_count | default(0) }}"
-          - "│  Rebooted : {{ win_result.rebooted | default(false) }}"
-          - "└──────────────────────────────"
+          - "============================================================"
+          - "              WINDOWS FLEET PATCH SUMMARY"
+          - "============================================================"
+          - "Total Servers            : {{ target_hosts | length }}"
+          - ""
+          - "Successful               : {{ successful_hosts | length }}"
+          - "Successful / Remaining   : {{ success_with_remaining_hosts | length }}"
+          - "Failed                   : {{ failed_hosts | length }}"
+          - "Rebooted                 : {{ rebooted_hosts | length }}"
+          - "Still Requires Reboot    : {{ reboot_required_hosts | length }}"
+          - "Unprocessed/Unreachable  : {{ unprocessed_hosts | length }}"
+          - ""
+          - "------------------------------------------------------------"
+          - "SUCCESS:"
+          - "{{ successful_hosts | join(', ') if successful_hosts else 'None' }}"
+          - ""
+          - "SUCCESS WITH REMAINING UPDATES:"
+          - "{{ success_with_remaining_hosts | join(', ') if success_with_remaining_hosts else 'None' }}"
+          - ""
+          - "FAILED:"
+          - "{{ failed_hosts | join(', ') if failed_hosts else 'None' }}"
+          - ""
+          - "REBOOTED:"
+          - "{{ rebooted_hosts | join(', ') if rebooted_hosts else 'None' }}"
+          - ""
+          - "STILL REQUIRES REBOOT:"
+          - "{{ reboot_required_hosts | join(', ') if reboot_required_hosts else 'None' }}"
+          - ""
+          - "UNPROCESSED / UNREACHABLE:"
+          - "{{ unprocessed_hosts | join(', ') if unprocessed_hosts else 'None' }}"
+          - "============================================================"
+
+    # ========================================================
+    # Detailed report for each Windows host
+    # ========================================================
+
+    - name: Display detailed Windows fleet report
+      ansible.builtin.debug:
+        msg:
+          - "------------------------------------------------------------"
+          - "Server             : {{ item }}"
+          - "OS                 : {{ hostvars[item].windows_caption | default('N/A') }}"
+          - "Version            : {{ hostvars[item].windows_version | default('N/A') }}"
+          - "Build Before       : {{ hostvars[item].windows_build | default('N/A') }}"
+          - "Build After        : {{ hostvars[item].windows_build_after | default('N/A') }}"
+          - ""
+          - "Updates Before     : {{ hostvars[item].updates_before_count | default('N/A') }}"
+          - "Installed          : {{ hostvars[item].updates_installed_count | default('N/A') }}"
+          - "Failed             : {{ hostvars[item].updates_failed_count | default('N/A') }}"
+          - "Updates Remaining  : {{ hostvars[item].updates_after_count | default('N/A') }}"
+          - ""
+          - "Reboot Required    : {{ hostvars[item].reboot_required | default('N/A') }}"
+          - "Rebooted           : {{ hostvars[item].rebooted | default('N/A') }}"
+          - ""
+          - "FINAL STATUS       : {{ hostvars[item].windows_patch_status | default('UNREACHABLE_OR_NOT_PROCESSED') }}"
+          - "Message            : {{ hostvars[item].windows_patch_message | default('Host could not be processed') }}"
+          - "------------------------------------------------------------"
+
+      loop: "{{ target_hosts }}"
