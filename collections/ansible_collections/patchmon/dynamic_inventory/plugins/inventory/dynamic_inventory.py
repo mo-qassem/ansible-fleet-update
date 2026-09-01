@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 from __future__ import absolute_import, division, print_function
+
 __metaclass__ = type
 
 DOCUMENTATION = r"""
@@ -10,10 +11,15 @@ DOCUMENTATION = r"""
         - Queries the PatchMon REST API and builds an Ansible inventory.
         - Uses PatchMon API os_type field to classify hosts.
         - Windows hosts are placed only in windows_hosts.
-        - Linux hosts are placed only in linux_hosts.
+        - Linux hosts are placed in linux_hosts.
+        - Managed Linux hosts are additionally placed in managed_hosts.
+        - A managed Linux host must belong to at least one PatchMon host group:
+          Basic, Advanced, Professional, or Exa.
+        - Linux hosts belonging only to groups such as Proxmox remain in
+          linux_hosts and are not added to managed_hosts.
         - Hosts with missing or unknown os_type are placed in unknown_os_hosts.
-        - PatchMon host_groups such as Basic, Advanced, Professional are saved
-          as host variables only, not created as Ansible inventory groups.
+        - PatchMon host_groups are saved as host variables and are not created
+          as Ansible inventory groups.
         - Credentials are read from AWX environment variables.
         - Do NOT use Jinja2 lookup() in the inventory config file because AWX
           inventory source sync does not process it the same way as a playbook.
@@ -92,6 +98,7 @@ display = Display()
 
 try:
     import requests
+
     HAS_REQUESTS = True
 except ImportError:
     HAS_REQUESTS = False
@@ -180,10 +187,13 @@ class InventoryModule(BaseInventoryPlugin):
         timeout = self.get_option("timeout")
         winrm_port = self.get_option("winrm_port")
         winrm_transport = self.get_option("winrm_transport")
-        winrm_cert_validation = self.get_option("winrm_server_cert_validation")
+        winrm_cert_validation = self.get_option(
+            "winrm_server_cert_validation"
+        )
 
         missing = [
-            key for key, value in {
+            key
+            for key, value in {
                 "PATCHMON_API_URL": api_url,
                 "PATCHMON_API_KEY": api_key,
                 "PATCHMON_API_SECRET": api_secret,
@@ -243,13 +253,21 @@ class InventoryModule(BaseInventoryPlugin):
                 "PATCHMON_API_URL must point to the hosts API endpoint, for example:\n"
                 "https://patchmon.example.com/api/v1/api/hosts/\n\n"
                 "Current URL: {1}\n"
-                "Preview: {2}".format(resp.status_code, api_url, preview[:200])
+                "Preview: {2}".format(
+                    resp.status_code,
+                    api_url,
+                    preview[:200],
+                )
             )
 
         if resp.status_code != 200:
             raise AnsibleError(
                 "PatchMon: unexpected HTTP {0} from {1}\n"
-                "Body preview: {2}".format(resp.status_code, api_url, preview)
+                "Body preview: {2}".format(
+                    resp.status_code,
+                    api_url,
+                    preview,
+                )
             )
 
         try:
@@ -259,85 +277,294 @@ class InventoryModule(BaseInventoryPlugin):
                 "PatchMon: non-JSON response.\n"
                 "URL: {0}\n"
                 "Preview: {1}\n"
-                "Error: {2}".format(api_url, preview[:200], e)
+                "Error: {2}".format(
+                    api_url,
+                    preview[:200],
+                    e,
+                )
             )
 
         hosts = data.get("hosts", [])
 
         if not hosts:
             display.warning(
-                "PatchMon: API returned 0 hosts. Check API URL and API key permissions."
+                "PatchMon: API returned 0 hosts. "
+                "Check API URL and API key permissions."
             )
             return
 
-        display.vv("PatchMon: {0} host(s) received".format(len(hosts)))
+        display.vv(
+            "PatchMon: {0} host(s) received".format(len(hosts))
+        )
 
-        # Only these groups will be created for targeting playbooks.
+        # ====================================================
+        # Ansible inventory groups
+        # ====================================================
+        #
+        # OS-based groups:
+        #   linux_hosts
+        #   windows_hosts
+        #   unknown_os_hosts
+        #
+        # Management group:
+        #   managed_hosts
+        #
+        # managed_hosts contains Linux systems only, and only
+        # when PatchMon host_groups includes at least one of:
+        #
+        #   Basic
+        #   Advanced
+        #   Professional
+        #   Exa
+        #
+        # PatchMon logical groups themselves are NOT created as
+        # Ansible inventory groups.
+        # ====================================================
+
         self.inventory.add_group("linux_hosts")
         self.inventory.add_group("windows_hosts")
         self.inventory.add_group("unknown_os_hosts")
+        self.inventory.add_group("managed_hosts")
+
+        # Case-insensitive PatchMon group names considered managed.
+        managed_patchmon_groups = {
+            "basic",
+            "advanced",
+            "professional",
+            "exa",
+        }
 
         linux_count = 0
         windows_count = 0
         unknown_count = 0
+        managed_count = 0
 
         for h in hosts:
-            friendly_name = str(h.get("friendly_name", "") or "").strip()
-            hostname = str(h.get("hostname", "") or "").strip()
-            ip = str(h.get("ip", "") or "").strip()
-            host_id = str(h.get("id", "") or "").strip()
+            friendly_name = str(
+                h.get("friendly_name", "") or ""
+            ).strip()
+
+            hostname = str(
+                h.get("hostname", "") or ""
+            ).strip()
+
+            ip = str(
+                h.get("ip", "") or ""
+            ).strip()
+
+            host_id = str(
+                h.get("id", "") or ""
+            ).strip()
 
             # Friendly name is what will appear in AWX.
-            # Fallback order prevents skipping hosts if friendly_name is empty.
+            # Fallback order prevents skipping hosts if
+            # friendly_name is empty.
             inv_hostname = friendly_name or hostname or host_id
 
             if not inv_hostname:
-                display.warning("PatchMon: skipping host with no friendly_name, hostname, or id")
+                display.warning(
+                    "PatchMon: skipping host with no friendly_name, "
+                    "hostname, or id"
+                )
                 continue
 
             self.inventory.add_host(inv_hostname)
 
             if ip:
-                self.inventory.set_variable(inv_hostname, "ansible_host", ip)
+                self.inventory.set_variable(
+                    inv_hostname,
+                    "ansible_host",
+                    ip,
+                )
 
-            # Keep useful PatchMon metadata as host vars.
-            self.inventory.set_variable(inv_hostname, "patchmon_id", h.get("id"))
-            self.inventory.set_variable(inv_hostname, "patchmon_hostname", hostname)
-            self.inventory.set_variable(inv_hostname, "patchmon_friendly_name", friendly_name)
-            self.inventory.set_variable(inv_hostname, "patchmon_os_type", h.get("os_type"))
-            self.inventory.set_variable(inv_hostname, "patchmon_needs_reboot", h.get("needs_reboot"))
-            self.inventory.set_variable(inv_hostname, "patchmon_last_update", h.get("last_update"))
+            # =================================================
+            # Keep useful PatchMon metadata as host variables
+            # =================================================
 
-            # Keep Basic/Advanced/Professional as a variable only.
-            # We do not create Ansible groups from these.
+            self.inventory.set_variable(
+                inv_hostname,
+                "patchmon_id",
+                h.get("id"),
+            )
+
+            self.inventory.set_variable(
+                inv_hostname,
+                "patchmon_hostname",
+                hostname,
+            )
+
+            self.inventory.set_variable(
+                inv_hostname,
+                "patchmon_friendly_name",
+                friendly_name,
+            )
+
+            self.inventory.set_variable(
+                inv_hostname,
+                "patchmon_os_type",
+                h.get("os_type"),
+            )
+
+            self.inventory.set_variable(
+                inv_hostname,
+                "patchmon_needs_reboot",
+                h.get("needs_reboot"),
+            )
+
+            self.inventory.set_variable(
+                inv_hostname,
+                "patchmon_last_update",
+                h.get("last_update"),
+            )
+
+            # =================================================
+            # Read PatchMon logical groups
+            # =================================================
+            #
+            # Example:
+            #
+            #   Basic
+            #   Advanced
+            #   Professional
+            #   Exa
+            #   Proxmox
+            #
+            # These remain host variables.
+            # They are NOT automatically created as Ansible
+            # inventory groups.
+            # =================================================
+
             patchmon_groups = []
 
             for g in h.get("host_groups", []) or []:
-                group_name = str(g.get("name", "") or "").strip()
+                group_name = str(
+                    g.get("name", "") or ""
+                ).strip()
+
                 if group_name:
                     patchmon_groups.append(group_name)
 
-            self.inventory.set_variable(inv_hostname, "patchmon_host_groups", patchmon_groups)
+            self.inventory.set_variable(
+                inv_hostname,
+                "patchmon_host_groups",
+                patchmon_groups,
+            )
+
+            # =================================================
+            # Determine whether PatchMon considers host managed
+            # =================================================
+            #
+            # Normalization makes matching case-insensitive:
+            #
+            #   BASIC
+            #   Basic
+            #   basic
+            #
+            # are treated the same.
+            # =================================================
+
+            patchmon_groups_normalized = {
+                group_name.lower()
+                for group_name in patchmon_groups
+            }
+
+            matched_managed_groups = sorted(
+                patchmon_groups_normalized
+                & managed_patchmon_groups
+            )
+
+            is_managed_patchmon_host = bool(
+                matched_managed_groups
+            )
+
+            # This variable means the PatchMon group membership
+            # matches the managed policy. A host is added to the
+            # managed_hosts Ansible group only if it is ALSO Linux.
+            self.inventory.set_variable(
+                inv_hostname,
+                "patchmon_managed_group_match",
+                is_managed_patchmon_host,
+            )
+
+            self.inventory.set_variable(
+                inv_hostname,
+                "patchmon_managed_groups",
+                matched_managed_groups,
+            )
+
+            # =================================================
+            # Detect OS
+            # =================================================
 
             os_family, reason = _detect_os_type(h)
 
+            # Final managed state requires:
+            #
+            #   Linux
+            #     AND
+            #   Basic/Advanced/Professional/Exa
+            #
+            is_managed_linux_host = (
+                os_family == "linux"
+                and is_managed_patchmon_host
+            )
+
+            self.inventory.set_variable(
+                inv_hostname,
+                "patchmon_managed",
+                is_managed_linux_host,
+            )
+
             display.vvv(
-                "PatchMon: {0} ({1}) os_type={2} groups={3} -> {4} [{5}]".format(
+                "PatchMon: {0} ({1}) "
+                "os_type={2} "
+                "groups={3} "
+                "managed_group_match={4} "
+                "managed_linux={5} "
+                "-> {6} [{7}]".format(
                     inv_hostname,
                     ip or "no IP",
                     h.get("os_type"),
-                    ",".join(patchmon_groups) if patchmon_groups else "no_groups",
+                    (
+                        ",".join(patchmon_groups)
+                        if patchmon_groups
+                        else "no_groups"
+                    ),
+                    is_managed_patchmon_host,
+                    is_managed_linux_host,
                     os_family,
                     reason,
                 )
             )
 
-            if os_family == "windows":
-                self.inventory.add_child("windows_hosts", inv_hostname)
+            # =================================================
+            # Windows hosts
+            # =================================================
 
-                self.inventory.set_variable(inv_hostname, "ansible_connection", "winrm")
-                self.inventory.set_variable(inv_hostname, "ansible_port", winrm_port)
-                self.inventory.set_variable(inv_hostname, "ansible_winrm_transport", winrm_transport)
+            if os_family == "windows":
+                self.inventory.add_child(
+                    "windows_hosts",
+                    inv_hostname,
+                )
+
+                self.inventory.set_variable(
+                    inv_hostname,
+                    "ansible_connection",
+                    "winrm",
+                )
+
+                self.inventory.set_variable(
+                    inv_hostname,
+                    "ansible_port",
+                    winrm_port,
+                )
+
+                self.inventory.set_variable(
+                    inv_hostname,
+                    "ansible_winrm_transport",
+                    winrm_transport,
+                )
+
                 self.inventory.set_variable(
                     inv_hostname,
                     "ansible_winrm_server_cert_validation",
@@ -346,19 +573,80 @@ class InventoryModule(BaseInventoryPlugin):
 
                 windows_count += 1
 
-            elif os_family == "linux":
-                self.inventory.add_child("linux_hosts", inv_hostname)
+            # =================================================
+            # Linux hosts
+            # =================================================
 
-                self.inventory.set_variable(inv_hostname, "ansible_connection", "ssh")
+            elif os_family == "linux":
+                # All Linux systems belong to linux_hosts.
+                self.inventory.add_child(
+                    "linux_hosts",
+                    inv_hostname,
+                )
+
+                self.inventory.set_variable(
+                    inv_hostname,
+                    "ansible_connection",
+                    "ssh",
+                )
 
                 linux_count += 1
 
-            else:
-                self.inventory.add_child("unknown_os_hosts", inv_hostname)
+                # ---------------------------------------------
+                # Managed Linux Hosts
+                # ---------------------------------------------
+                #
+                # Add only Linux systems belonging to one or
+                # more of:
+                #
+                #   Basic
+                #   Advanced
+                #   Professional
+                #   Exa
+                #
+                # Example:
+                #
+                # Linux + Basic
+                #   -> linux_hosts
+                #   -> managed_hosts
+                #
+                # Linux + Professional + Proxmox
+                #   -> linux_hosts
+                #   -> managed_hosts
+                #
+                # Linux + Proxmox only
+                #   -> linux_hosts
+                #
+                # Windows + Basic
+                #   -> windows_hosts only
+                #
+                # ---------------------------------------------
 
-                # Do not assume Windows or Linux when os_type is missing/unknown.
-                # Keep ansible_connection unset so it does not accidentally run
-                # under the wrong connection type.
+                if is_managed_linux_host:
+                    self.inventory.add_child(
+                        "managed_hosts",
+                        inv_hostname,
+                    )
+
+                    managed_count += 1
+
+            # =================================================
+            # Unknown OS hosts
+            # =================================================
+
+            else:
+                self.inventory.add_child(
+                    "unknown_os_hosts",
+                    inv_hostname,
+                )
+
+                # Do not assume Windows or Linux when os_type
+                # is missing/unknown.
+                #
+                # Keep ansible_connection unset so it does not
+                # accidentally run under the wrong connection
+                # type.
+
                 unknown_count += 1
 
                 display.warning(
@@ -369,11 +657,19 @@ class InventoryModule(BaseInventoryPlugin):
                     )
                 )
 
+        # ====================================================
+        # Final inventory summary
+        # ====================================================
+
         display.v(
-            "PatchMon: inventory ready — {0} Linux host(s), {1} Windows host(s), "
-            "{2} unknown host(s)".format(
+            "PatchMon: inventory ready — "
+            "{0} Linux host(s), "
+            "{1} Windows host(s), "
+            "{2} unknown host(s), "
+            "{3} managed Linux host(s)".format(
                 linux_count,
                 windows_count,
                 unknown_count,
+                managed_count,
             )
         )
